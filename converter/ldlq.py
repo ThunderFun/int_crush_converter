@@ -101,19 +101,28 @@ def ldlq_quantize_layer(
     # Initial per-row scales
     row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=1e-6)
 
-    # Expand to per-element scales for LDLQ
+    # Expand to per-element scales for LDLQ (all elements in a row share
+    # the same scale, so this is equivalent to per-row quantization with
+    # column-by-column error propagation).
     flat_scales = row_scales.expand(M, N).reshape(-1).clone()
 
-    if iterations <= 1:
-        quantized_W = _single_ldlq_pass(W, H_inv, flat_scales, block_size, clamp_min, clamp_max)
-    else:
-        quantized_W, flat_scales = _run_iterative_ldlq(
-            W, H_inv, flat_scales, iterations, block_size, clamp_min, clamp_max
+    if iterations > 1:
+        warnings.warn(
+            "LDLQ scale refinement (iterations > 1) is incompatible with "
+            "per-row scale storage. Using a single pass instead.",
+            stacklevel=2,
         )
 
-    # Return per-row scales (float16) for compatibility with packing/loading
-    # Recompute from the quantized result to stay consistent
-    final_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=1e-6)
+    quantized_W = _single_ldlq_pass(W, H_inv, flat_scales, block_size, clamp_min, clamp_max)
+
+    # Compute the per-row scale that best fits the quantized integers to the
+    # original weights.  For each row i the least-squares optimum is:
+    #   s_i = (Q · W).sum(dim=1) / (Q · Q).sum(dim=1)
+    # This keeps Q unchanged while finding the best dequantization scale.
+    Q_float = quantized_W.float()
+    numerator = (Q_float * W).sum(dim=1, keepdim=True)
+    denominator = (Q_float * Q_float).sum(dim=1, keepdim=True).clamp(min=1e-8)
+    final_scales = (numerator / denominator).clamp(min=1e-6)
     return quantized_W, final_scales.to(torch.float16)
 
 

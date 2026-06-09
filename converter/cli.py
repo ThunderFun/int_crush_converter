@@ -88,6 +88,10 @@ def quantize_model(
     if quant_method == "gptq" and not calibration_path:
         raise ValueError("GPTQ requires --calibration path to a .pt file")
 
+    if quant_method == "ldlq" and calibration_path:
+        import warnings
+        warnings.warn("LDLQ does not use calibration data; --calibration path will be ignored")
+
     if rot_size > 0 and not _is_power_of_two(rot_size):
         raise ValueError(f"rot_size must be 0 (no rotation) or a power of 2, got {rot_size}")
 
@@ -138,7 +142,7 @@ def quantize_model(
     # weights cause wrong model configuration. Store originals so the
     # loader can fix the model after creation.
     padded_layers = {}
-    if rot_size > 0 and is_int8:
+    if rot_size > 0:
         for name, tensor in state_dict.items():
             if tensor.dim() == 2 and not should_skip(name, skip_patterns):
                 orig_in = tensor.shape[1]
@@ -206,16 +210,27 @@ def quantize_model(
                 # Calibration permutation: apply to weight only.
                 # Hessian is already in permuted space from calibration.
                 orig_features = min(orig_in_features, cal_perm.shape[0])
-                W_orig = W_work[:, :orig_features]
-                W_work[:, :orig_features] = W_orig[:, cal_perm[:orig_features]]
-                perm_orig = cal_perm[:orig_features]
-                perm_applied = True
-                permuted += 1
-                print(f"  PermuQuant applied (from calibration)")
-            else:
+                perm_slice = cal_perm[:orig_features]
+                if (perm_slice.max() < orig_features
+                        and perm_slice.min() >= 0
+                        and perm_slice.unique().numel() == perm_slice.numel()):
+                    W_orig = W_work[:, :orig_features]
+                    W_work[:, :orig_features] = W_orig[:, perm_slice]
+                    perm_orig = perm_slice
+                    perm_applied = True
+                    permuted += 1
+                    print(f"  PermuQuant applied (from calibration)")
+                else:
+                    print(f"  WARNING: calibration permutation out of bounds, falling back to weight-only")
+
+            if not perm_applied:
                 W_orig = W_work[:, :orig_in_features]
+                # For INT4, all methods (RTN, GPTQ, LDLQ) use per-row
+                # quantization.  PermuQuant's acceptance check must use the
+                # same granularity or it evaluates a different scheme.
+                actual_group_size = W_orig.shape[1] if int_bits == 4 else group_size
                 perm, alpha, accepted = sweep_alpha(
-                    W_orig, act_mu2=None, group_size=group_size, tau=tau, int_bits=int_bits
+                    W_orig, act_mu2=None, group_size=actual_group_size, tau=tau, int_bits=int_bits
                 )
                 if accepted:
                     W_work[:, :orig_in_features] = W_orig[:, perm]
@@ -234,28 +249,42 @@ def quantize_model(
             if layer_name is not None:
                 hessian = get_hessian(calibration, layer_name, tensor.shape)
 
-                if hessian is not None:
-                    # Rotate Hessian to match rotated weight space: H_rot = R^T @ H @ R
-                    # This must happen BEFORE PermuQuant permutation because
-                    # permutation and rotation do not commute in general.
-                    # Skip if calibration data is already in rotated space.
-                    already_rotated = calibration.get("metadata", {}).get("hessian_rotated", False)
-                    if rot_size > 0 and not already_rotated:
-                        hessian = rotate_hessian(hessian, rot_size)
+            if hessian is not None:
+                already_rotated = calibration.get("metadata", {}).get("hessian_rotated", False)
 
-                    # Apply PermuQuant permutation to Hessian only if we computed
-                    # our own (the Hessian is already in permuted space when the
-                    # permutation came from calibration).
-                    if perm_applied and cal_perm is None:
+                if not already_rotated:
+                    if cal_perm is not None:
+                        # Calibration Hessian: P^T @ H @ P = H[inv_perm][:, inv_perm].
+                        # To recover H[perm][:, perm] (the permuted weight space),
+                        # index by cal_perm composed with itself.
                         if hessian.dim() == 2:
-                            hessian = hessian[perm_orig][:, perm_orig]
+                            perm_sq = cal_perm[cal_perm]
+                            hessian = hessian[perm_sq][:, perm_sq]
                         else:
                             raise ValueError(
-                                f"PermuQuant permutation cannot be applied to "
-                                f"block-diagonal Hessian ({hessian.dim()}D, shape "
-                                f"{hessian.shape}). Regenerate calibration data "
-                                f"with the permutation applied."
+                                "Calibration permutation + block-diagonal Hessian "
+                                "is not supported. Regenerate calibration data "
+                                "with the permutation applied."
                             )
+
+                    # Rotate: H_rot = R^T @ H @ R
+                    if rot_size > 0:
+                        hessian = rotate_hessian(hessian, rot_size)
+
+                # Re-permute only when we computed our own permutation
+                # (cal_perm is None).  When calibration provides the
+                # permutation the un-permute + rotate already produced
+                # the correct Hessian for the permuted-rotated weight.
+                if perm_applied and cal_perm is None:
+                    if hessian.dim() == 2:
+                        hessian = hessian[perm_orig][:, perm_orig]
+                    else:
+                        raise ValueError(
+                            f"PermuQuant permutation cannot be applied to "
+                            f"block-diagonal Hessian ({hessian.dim()}D, shape "
+                            f"{hessian.shape}). Regenerate calibration data "
+                            f"with the permutation applied."
+                        )
 
                 # Quantize the full rotated weight (no truncation).
                 # If rotation padded the weight, the padded columns will have
@@ -269,7 +298,7 @@ def quantize_model(
                 )
                 gptq_count += 1
             else:
-                # Fallback to RTN if no calibration data for this layer
+                # Fallback to RTN if no calibration data or Hessian is missing/mismatched
                 quantized_W, scales = gptq_quantize_layer_rtn(W_work, int_bits=int_bits)
                 rtn_fallback += 1
                 print(f"  No calibration data, using RTN fallback")
@@ -374,7 +403,8 @@ def main() -> None:
     parser.add_argument("--int-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bit-width: 4 (INT4) or 8 (INT8, default: 4)")
     parser.add_argument("--group-size", type=int, default=128,
-                        help="Quantization group size, INT4 only (default: 128)")
+                        help="PermuQuant group size for acceptance evaluation (default: 128). "
+                             "INT4 quantization always uses per-row scales for speed.")
     parser.add_argument("--permuquant", action="store_true",
                         help="Enable PermuQuant channel reordering")
     parser.add_argument("--tau", type=float, default=0.0,

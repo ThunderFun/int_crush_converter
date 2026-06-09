@@ -131,7 +131,7 @@ def ldlq_loop_triton(
             M, N, i1,
             CLAMP_MIN=float(clamp_min),
             CLAMP_MAX=float(clamp_max),
-            BLOCK_COLS=block_size,
+            BLOCK_COLS=block_count,
             BLOCK_ROWS=BLOCK_ROWS,
         )
 

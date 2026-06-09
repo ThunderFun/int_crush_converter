@@ -126,6 +126,7 @@ def gptq_quantize_layer(
             H_block = H_block + damping * diag_mean * torch.eye(actual_bs, dtype=torch.float32)
 
             H_inv = _invert_hessian(H_block)
+            H_inv = H_inv.to(W.device)
 
             if _gptq_block_triton(
                 W_work, quantized_W, row_scales, H_inv,
@@ -149,6 +150,7 @@ def gptq_quantize_layer(
         H = H + damping * diag_mean * torch.eye(in_features, dtype=torch.float32)
 
         H_inv = _invert_hessian(H)
+        H_inv = H_inv.to(W.device)
 
         if _gptq_block_triton(
             W_work, quantized_W, row_scales, H_inv,
