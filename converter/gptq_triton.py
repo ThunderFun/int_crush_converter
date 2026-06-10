@@ -2,7 +2,8 @@
 
 Processes one full block of columns in a single kernel launch, keeping
 Hinv_block in registers for the entire block. Supports INT4 and INT8
-via constexpr parameters.
+via constexpr parameters, and asymmetric quantization via optional
+zero-point vector.
 """
 
 import torch
@@ -21,6 +22,7 @@ if _HAS_GPTQ_TRITON:
     def _gptq_block_kernel(
         W_work_ptr,
         scale_ptr,
+        zp_ptr,
         Hinv_block_ptr,
         Q_out_ptr,
         err_accum_ptr,
@@ -32,13 +34,26 @@ if _HAS_GPTQ_TRITON:
         hinv_stride,
         CLAMP_MIN: tl.constexpr,
         CLAMP_MAX: tl.constexpr,
+        HAS_ZP: tl.constexpr,
         BLOCK_ROWS: tl.constexpr,
     ):
-        """Triton kernel for full GPTQ block processing."""
+        """Triton kernel for full GPTQ block processing.
+
+        When HAS_ZP is True, uses asymmetric quantization:
+            q = round(W / scale + zp)
+            err = W - (q - zp) * scale
+        When HAS_ZP is False, uses symmetric quantization:
+            q = round(W / scale)
+            err = W - q * scale
+        """
         pid = tl.program_id(0)
         row_start = pid * BLOCK_ROWS
         row_offs = row_start + tl.arange(0, BLOCK_ROWS)
         row_mask = row_offs < M
+
+        zp_vals = tl.zeros([BLOCK_ROWS], dtype=tl.float32)
+        if HAS_ZP:
+            zp_vals = tl.load(zp_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
 
         for j_local in range(block_count):
             j = col_start + j_local
@@ -50,18 +65,21 @@ if _HAS_GPTQ_TRITON:
             scale_vals = tl.load(scale_ptr + row_offs, mask=row_mask, other=1.0).to(tl.float32)
             scale_vals = tl.maximum(scale_vals, 1e-8)
 
-            y = w_work / scale_vals
+            if HAS_ZP:
+                y = w_work / scale_vals + zp_vals
+            else:
+                y = w_work / scale_vals
 
-            rounded = tl.floor(y + 0.5)
-            remainder = y - rounded
-            is_half = tl.abs(tl.abs(remainder) - 0.5) < 1e-6
-            is_odd = tl.abs(rounded - 2.0 * tl.floor(rounded / 2.0)) > 0.5
-            q = tl.where(is_half & is_odd, rounded - 1.0, rounded)
+            # Round half away from zero (consistent with PyTorch path)
+            q = tl.where(y >= 0, tl.floor(y + 0.5), -tl.floor(-y + 0.5))
 
             q = tl.minimum(tl.maximum(q, CLAMP_MIN), CLAMP_MAX)
             tl.store(Q_out_ptr + q_idx, q.to(tl.int8), mask=row_mask)
 
-            err = w_work - q * scale_vals
+            if HAS_ZP:
+                err = w_work - (q - zp_vals) * scale_vals
+            else:
+                err = w_work - q * scale_vals
 
             hinv_diag = tl.load(Hinv_block_ptr + j_local * hinv_stride + j_local)
             hinv_diag = tl.maximum(hinv_diag, 1e-8)
@@ -92,6 +110,7 @@ def gptq_loop_triton(
     block_size: int,
     clamp_min: int,
     clamp_max: int,
+    row_zp: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """GPU GPTQ loop using the Triton block kernel.
 
@@ -105,6 +124,8 @@ def gptq_loop_triton(
         block_size: column block size
         clamp_min: minimum quantized value (-8 for INT4, -128 for INT8)
         clamp_max: maximum quantized value (7 for INT4, 127 for INT8)
+        row_zp: [M] per-row zero-points (1D, optional). When provided,
+                uses asymmetric quantization: q = round(W/scale + zp).
 
     Returns:
         Q_out (same tensor, modified in-place), or None if Triton unavailable.
@@ -120,6 +141,13 @@ def gptq_loop_triton(
     if not row_scales.is_contiguous():
         row_scales = row_scales.contiguous()
 
+    has_zp = row_zp is not None
+    if has_zp:
+        zp_1d = row_zp.squeeze().contiguous().to(torch.float32)
+        zp_gpu = zp_1d.to(W_work.device)
+    else:
+        zp_gpu = None
+
     BLOCK_ROWS = 64
 
     for i1 in range(0, N, block_size):
@@ -131,11 +159,13 @@ def gptq_loop_triton(
 
         grid = (triton.cdiv(M, BLOCK_ROWS),)
         _gptq_block_kernel[grid](
-            W_work, row_scales, Hinv_block, Q_out, err_accum,
+            W_work, row_scales, zp_gpu if has_zp else row_scales,
+            Hinv_block, Q_out, err_accum,
             M, W_work.shape[1], Q_out.shape[1], i1,
             block_count, Hinv_block.shape[1],
             CLAMP_MIN=float(clamp_min),
             CLAMP_MAX=float(clamp_max),
+            HAS_ZP=has_zp,
             BLOCK_ROWS=BLOCK_ROWS,
         )
 

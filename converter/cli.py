@@ -13,7 +13,12 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from .rotation import rotate_weights, _is_power_of_two, rotate_hessian
-from .scales import calculate_scales, quantize_weights, calculate_scales_int8, quantize_weights_int8
+from .scales import (
+    calculate_scales, quantize_weights,
+    calculate_scales_int8, quantize_weights_int8,
+    calculate_scales_asymmetric, quantize_weights_asymmetric,
+    calculate_scales_int8_asymmetric, quantize_weights_int8_asymmetric,
+)
 from .packing import pack_int4
 from .permuquant import find_permutation_weight, sweep_alpha
 from .calibration_io import load_calibration, build_name_map, get_hessian, get_permutation
@@ -57,6 +62,8 @@ def quantize_model(
     int_bits: int = 4,
     ldlq_iterations: int = 1,
     comfy_compat: bool = False,
+    asymmetric: bool = False,
+    clipping_ratios: list[float] | None = None,
 ) -> None:
     """Quantize a model from safetensors using INT-Crush + PermuQuant + GPTQ/LDLQ.
 
@@ -74,6 +81,8 @@ def quantize_model(
         damping: GPTQ/LDLQ damping ratio (default: 0.01)
         int_bits: quantization bit-width (4 or 8)
         ldlq_iterations: Number of LDLQ iterations with scale refinement (default: 1)
+        asymmetric: Use asymmetric quantization (scale + zero-point)
+        clipping_ratios: List of clipping ratios to search for lowest MSE
     """
     if skip_patterns is None:
         skip_patterns = DEFAULT_SKIP_PATTERNS
@@ -127,7 +136,7 @@ def quantize_model(
         f"{meta_prefix}.format_version": "3" if not is_int8 else "1",
         f"{meta_prefix}.method": method,
         f"{meta_prefix}.rot_size": str(rot_size),
-        f"{meta_prefix}.scale_type": "per_row",
+        f"{meta_prefix}.scale_type": "per_row_asymmetric" if asymmetric else "per_row",
         f"{meta_prefix}.hadamard_type": "regular",
     }
     if not is_int8:
@@ -241,6 +250,8 @@ def quantize_model(
                 else:
                     print(f"  PermuQuant skipped (no improvement)")
 
+        zero_points = None
+
         # 3. Quantize
         if quant_method == "gptq":
             # GPTQ: use Hessian-based error compensation
@@ -290,7 +301,7 @@ def quantize_model(
                 # If rotation padded the weight, the padded columns will have
                 # zero Hessian diagonal — damping prevents div-by-zero, and
                 # error compensation naturally skips zero-energy columns.
-                quantized_W, scales = gptq_quantize_layer(
+                quantized_W, scales, zero_points = gptq_quantize_layer(
                     W_work, hessian,
                     block_size=gptq_block_size,
                     damping=damping,
@@ -299,7 +310,15 @@ def quantize_model(
                 gptq_count += 1
             else:
                 # Fallback to RTN if no calibration data or Hessian is missing/mismatched
-                quantized_W, scales = gptq_quantize_layer_rtn(W_work, int_bits=int_bits)
+                zero_points = None
+                rtn_result = gptq_quantize_layer_rtn(
+                    W_work, int_bits=int_bits,
+                    asymmetric=asymmetric, clipping_ratios=clipping_ratios,
+                )
+                if asymmetric:
+                    quantized_W, scales, zero_points = rtn_result
+                else:
+                    quantized_W, scales = rtn_result
                 rtn_fallback += 1
                 print(f"  No calibration data, using RTN fallback")
         elif quant_method == "ldlq":
@@ -317,13 +336,31 @@ def quantize_model(
             gptq_count += 1
         else:
             # RTN: simple round-to-nearest
-            if is_int8:
-                scales = calculate_scales_int8(W_work)
-                quantized_W = quantize_weights_int8(W_work, scales)
+            zero_points = None
+            if asymmetric:
+                if is_int8:
+                    scales, zero_points = calculate_scales_int8_asymmetric(
+                        W_work, clipping_ratios=clipping_ratios
+                    )
+                    quantized_W = quantize_weights_int8_asymmetric(
+                        W_work, scales, zero_points
+                    )
+                else:
+                    in_features = W_work.shape[1]
+                    scales, zero_points = calculate_scales_asymmetric(
+                        W_work, in_features, clipping_ratios=clipping_ratios
+                    )
+                    quantized_W = quantize_weights_asymmetric(
+                        W_work, scales, zero_points, in_features
+                    )
             else:
-                in_features = W_work.shape[1]
-                scales = calculate_scales(W_work, in_features)
-                quantized_W = quantize_weights(W_work, scales, in_features)
+                if is_int8:
+                    scales = calculate_scales_int8(W_work, clipping_ratios=clipping_ratios)
+                    quantized_W = quantize_weights_int8(W_work, scales)
+                else:
+                    in_features = W_work.shape[1]
+                    scales = calculate_scales(W_work, in_features, clipping_ratios=clipping_ratios)
+                    quantized_W = quantize_weights(W_work, scales, in_features)
 
         # 4. Pack (INT4 only) or store directly (INT8)
         if is_int8:
@@ -332,7 +369,10 @@ def quantize_model(
             stored_weights = pack_int4(quantized_W)
 
         # 5. Verify: dequantize and compare to working weights
-        dequant = quantized_W.float() * scales.float()
+        if zero_points is not None:
+            dequant = (quantized_W.float() - zero_points.float()) * scales.float()
+        else:
+            dequant = quantized_W.float() * scales.float()
         mse = (W_work - dequant).pow(2).mean().item()
         max_err = (W_work - dequant).abs().max().item()
         bad_scales = scales.isinf().any() or scales.isnan().any() or (scales == 0).any()
@@ -343,6 +383,8 @@ def quantize_model(
         # Store weights and scales
         output_dict[name] = stored_weights
         output_dict[f"{name}_scale"] = scales
+        if zero_points is not None:
+            output_dict[f"{name}_zp"] = zero_points
 
         # ComfyUI-INT8-Fast compatibility: write comfy_quant metadata tensor
         if comfy_compat and rot_size > 0 and is_int8:
@@ -425,6 +467,11 @@ def main() -> None:
                         help="LDLQ iterations with scale refinement (default: 1)")
     parser.add_argument("--comfy-compat", action="store_true",
                         help="Write comfy_quant metadata for ComfyUI-INT8-Fast compatibility (INT8 + ConvRot only)")
+    parser.add_argument("--asymmetric", action="store_true",
+                        help="Use asymmetric quantization (scale + zero-point). Improves quality for skewed distributions.")
+    parser.add_argument("--clipping-ratios", type=str, default=None,
+                        help="Comma-separated clipping ratios to search for lowest-MSE scale per group. "
+                             "e.g. '0.8,0.85,0.9,0.95,1.0'. Smaller ratios clip outliers for finer resolution.")
 
     args = parser.parse_args()
 
@@ -435,6 +482,10 @@ def main() -> None:
     exclude_patterns = None
     if args.exclude_patterns:
         exclude_patterns = [p.strip() for p in args.exclude_patterns.split(",")]
+
+    clipping_ratios = None
+    if args.clipping_ratios:
+        clipping_ratios = [float(x.strip()) for x in args.clipping_ratios.split(",")]
 
     quantize_model(
         input_path=args.input,
@@ -452,6 +503,8 @@ def main() -> None:
         int_bits=args.int_bits,
         ldlq_iterations=args.ldlq_iterations,
         comfy_compat=args.comfy_compat,
+        asymmetric=args.asymmetric,
+        clipping_ratios=clipping_ratios,
     )
 
 

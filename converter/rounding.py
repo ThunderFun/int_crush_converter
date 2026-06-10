@@ -42,6 +42,7 @@ def _gptq_block(
     block_size: int,
     clamp_min: int,
     clamp_max: int,
+    row_zp: torch.Tensor | None = None,
 ) -> None:
     """Run GPTQ on a range of columns using the given inverse Hessian.
 
@@ -69,13 +70,22 @@ def _gptq_block(
             j_local = blk_start + j_offset
             j_global = col_start + j_local
 
-            # Quantize column using per-row scales (banker's rounding via .round())
+            # Quantize column using per-row scales and optional zero-point
             col = W_work[:, j_global]
-            q_col = (col / row_scales.squeeze(1)).round().clamp(clamp_min, clamp_max)
+            if row_zp is not None:
+                raw = col / row_scales.squeeze(1) + row_zp.squeeze(1)
+                q_col = _round_half_away_from_zero(raw).clamp(clamp_min, clamp_max)
+            else:
+                raw = col / row_scales.squeeze(1)
+                q_col = _round_half_away_from_zero(raw).clamp(clamp_min, clamp_max)
             quantized_W[:, j_global] = q_col.to(torch.int8)
 
-            # Normalised quantization error: (w - q) / H_inv[j, j]
-            err = (col - q_col * row_scales.squeeze(1)) / H_inv[j_local, j_local]
+            # Normalised quantization error: (w - dequant(q)) / H_inv[j, j]
+            if row_zp is not None:
+                dequant = (q_col - row_zp.squeeze(1)) * row_scales.squeeze(1)
+            else:
+                dequant = q_col * row_scales.squeeze(1)
+            err = (col - dequant) / H_inv[j_local, j_local]
             err = err.clamp(-100.0, 100.0)  # prevent numerical explosion
             err = torch.nan_to_num(err, nan=0.0, posinf=100.0, neginf=-100.0)
             E_block[:, j_offset] = err

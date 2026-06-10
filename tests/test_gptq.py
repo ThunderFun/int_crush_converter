@@ -32,7 +32,7 @@ class TestGPTQQuantizeLayer:
         """Quantized values must be in [-8, 7]."""
         W = torch.randn(16, 64)
         H = self._make_hessian(64)
-        q_W, scales = gptq_quantize_layer(W, H)
+        q_W, scales, _ = gptq_quantize_layer(W, H)
         assert q_W.min() >= -8
         assert q_W.max() <= 7
 
@@ -40,35 +40,35 @@ class TestGPTQQuantizeLayer:
         """Quantized output should be int8."""
         W = torch.randn(8, 32)
         H = self._make_hessian(32)
-        q_W, scales = gptq_quantize_layer(W, H)
+        q_W, scales, _ = gptq_quantize_layer(W, H)
         assert q_W.dtype == torch.int8
 
     def test_scales_dtype(self):
         """Scales should be float16."""
         W = torch.randn(8, 32)
         H = self._make_hessian(32)
-        _, scales = gptq_quantize_layer(W, H)
+        _, scales, _ = gptq_quantize_layer(W, H)
         assert scales.dtype == torch.float16
 
     def test_scales_shape_per_row(self):
         """Scales should have shape [out_features, 1] (per-row)."""
         W = torch.randn(16, 64)
         H = self._make_hessian(64)
-        _, scales = gptq_quantize_layer(W, H)
+        _, scales, _ = gptq_quantize_layer(W, H)
         assert scales.shape == (16, 1)
 
     def test_scales_positive(self):
         """All scales must be positive."""
         W = torch.randn(16, 64)
         H = self._make_hessian(64)
-        _, scales = gptq_quantize_layer(W, H)
+        _, scales, _ = gptq_quantize_layer(W, H)
         assert torch.all(scales > 0)
 
     def test_no_nan_inf_in_quantized(self):
         """Quantized weights and scales should not contain NaN or Inf."""
         W = torch.randn(16, 64)
         H = self._make_hessian(64)
-        q_W, scales = gptq_quantize_layer(W, H)
+        q_W, scales, _ = gptq_quantize_layer(W, H)
         assert not torch.any(torch.isnan(q_W.float()))
         assert not torch.any(torch.isinf(q_W.float()))
         assert not torch.any(torch.isnan(scales))
@@ -78,7 +78,7 @@ class TestGPTQQuantizeLayer:
         """Zero weights should quantize to zero."""
         W = torch.zeros(8, 32)
         H = self._make_hessian(32)
-        q_W, scales = gptq_quantize_layer(W, H)
+        q_W, scales, _ = gptq_quantize_layer(W, H)
         assert torch.all(q_W == 0)
 
     def test_gptq_reduces_error_vs_rtn(self):
@@ -93,14 +93,17 @@ class TestGPTQQuantizeLayer:
         H = X.T @ X  # Hessian from calibration data
 
         # GPTQ quantization
-        q_W_gptq, scales_gptq = gptq_quantize_layer(W, H)
+        q_W_gptq, scales_gptq, zp_gptq = gptq_quantize_layer(W, H)
 
         # RTN quantization (simple round-to-nearest)
         scales_rtn = calculate_scales(W, in_features)
         q_W_rtn = quantize_weights(W, scales_rtn, in_features)
 
         # Dequantize both
-        W_deq_gptq = q_W_gptq.float() * scales_gptq.float()
+        if zp_gptq is not None:
+            W_deq_gptq = (q_W_gptq.float() - zp_gptq.float()) * scales_gptq.float()
+        else:
+            W_deq_gptq = q_W_gptq.float() * scales_gptq.float()
         W_deq_rtn = q_W_rtn.float() * scales_rtn.float()
 
         # Compute output error: ||X @ W.T - X @ Q.T||^2
@@ -117,7 +120,7 @@ class TestGPTQQuantizeLayer:
         """GPTQ should work when block_size < in_features."""
         W = torch.randn(8, 128)
         H = self._make_hessian(128)
-        q_W, scales = gptq_quantize_layer(W, H, block_size=32)
+        q_W, scales, _ = gptq_quantize_layer(W, H, block_size=32)
         assert q_W.shape == (8, 128)
         assert q_W.min() >= -8
         assert q_W.max() <= 7
@@ -126,7 +129,7 @@ class TestGPTQQuantizeLayer:
         """GPTQ should work when block_size == in_features (single block)."""
         W = torch.randn(8, 64)
         H = self._make_hessian(64)
-        q_W, scales = gptq_quantize_layer(W, H, block_size=64)
+        q_W, scales, _ = gptq_quantize_layer(W, H, block_size=64)
         assert q_W.shape == (8, 64)
 
     def test_damping_prevents_singular_hessian(self):
@@ -135,7 +138,7 @@ class TestGPTQQuantizeLayer:
         # Create a very ill-conditioned Hessian
         H = torch.zeros(32, 32)
         H[0, 0] = 1.0  # rank-1
-        q_W, scales = gptq_quantize_layer(W, H, damping=0.1)
+        q_W, scales, _ = gptq_quantize_layer(W, H, damping=0.1)
         assert q_W.shape == (8, 32)
         assert not torch.any(torch.isnan(q_W.float()))
 
@@ -156,7 +159,7 @@ class TestGPTQQuantizeLayer:
             blocks.append(X.T @ X)
         H_block = torch.stack(blocks)  # [num_blocks, block_size, block_size]
 
-        q_W, scales = gptq_quantize_layer(W, H_block)
+        q_W, scales, _ = gptq_quantize_layer(W, H_block)
         assert q_W.shape == (out_features, in_features)
         assert scales.shape == (out_features, 1)
         assert q_W.min() >= -8
@@ -388,7 +391,7 @@ class TestCalibrationIO:
 
         H = get_hessian(cal, "layer.0", torch.Size([out_features, in_features]))
         assert H is not None
-        q_W, scales = gptq_quantize_layer(W, H)
+        q_W, scales, _ = gptq_quantize_layer(W, H)
         assert q_W.shape == (out_features, in_features)
         assert q_W.min() >= -8
         assert q_W.max() <= 7
@@ -417,7 +420,7 @@ class TestGPTQIntegration:
         H = X.T @ X
 
         # GPTQ quantize
-        q_W, scales = gptq_quantize_layer(W_rot, H)
+        q_W, scales, _ = gptq_quantize_layer(W_rot, H)
         assert q_W.shape == (out_features, in_features)
         assert scales.shape == (out_features, 1)  # per-row scales
 
@@ -452,7 +455,7 @@ class TestGPTQIntegration:
         H_perm = H[perm][:, perm]
 
         # GPTQ on permuted data
-        q_W, scales = gptq_quantize_layer(W_perm, H_perm)
+        q_W, scales, _ = gptq_quantize_layer(W_perm, H_perm)
         assert q_W.shape == (out_features, in_features)
         assert q_W.min() >= -8
         assert q_W.max() <= 7
@@ -493,7 +496,7 @@ class TestGPTQIntegration:
         assert torch.allclose(H, H_rot, atol=1e-5)
 
         # GPTQ on the pre-rotated Hessian with rotated weights
-        q_W, scales = gptq_quantize_layer(W_rot, H)
+        q_W, scales, _ = gptq_quantize_layer(W_rot, H)
         assert q_W.shape == (out_features, in_features)
         assert q_W.min() >= -8
         assert q_W.max() <= 7
@@ -525,7 +528,7 @@ class TestGPTQIntegration:
         }
         H_a = get_hessian(cal_unrot, "layer.0", torch.Size([out_features, in_features]))
         H_a = rotate_hessian(H_a, rot_size)  # converter does this
-        q_a, s_a = gptq_quantize_layer(W_rot, H_a)
+        q_a, s_a, _ = gptq_quantize_layer(W_rot, H_a)
 
         # Path B: pre-rotated calibration → converter skips rotation
         torch.manual_seed(42)
@@ -541,7 +544,7 @@ class TestGPTQIntegration:
             "metadata": {"hessian_rotated": True, "rot_size": rot_size},
         }
         H_b = get_hessian(cal_rot, "layer.0", torch.Size([out_features, in_features]))
-        q_b, s_b = gptq_quantize_layer(W_rot, H_b)
+        q_b, s_b, _ = gptq_quantize_layer(W_rot, H_b)
 
         # Both paths should produce identical Hessians and quantized weights
         assert torch.allclose(H_a, H_b, atol=1e-4)
@@ -611,7 +614,7 @@ class TestCalibrationPermutation:
         W_perm = W[:, perm]
 
         # GPTQ with the already-permuted Hessian — should NOT double-permute
-        q_W, scales = gptq_quantize_layer(W_perm, H_perm)
+        q_W, scales, _ = gptq_quantize_layer(W_perm, H_perm)
         assert q_W.shape == (out_features, in_features)
         assert q_W.min() >= -8
         assert q_W.max() <= 7
@@ -632,13 +635,13 @@ class TestCalibrationPermutation:
         # Path A: manual permute both weight and Hessian
         W_a = W[:, perm]
         H_a = H[perm][:, perm]
-        q_a, s_a = gptq_quantize_layer(W_a, H_a)
+        q_a, s_a, _ = gptq_quantize_layer(W_a, H_a)
 
         # Path B: "calibration" provides perm; Hessian already in permuted space
         X_perm = X[:, perm]
         H_b = X_perm.T @ X_perm
         W_b = W[:, perm]
-        q_b, s_b = gptq_quantize_layer(W_b, H_b)
+        q_b, s_b, _ = gptq_quantize_layer(W_b, H_b)
 
         # Both should be identical
         assert torch.equal(q_a, q_b)
@@ -667,7 +670,7 @@ class TestCalibrationPermutation:
 
         # GPTQ should accept this without raising ValueError
         W_perm = W[:, perm]
-        q_W, scales = gptq_quantize_layer(W_perm, H_blocks)
+        q_W, scales, _ = gptq_quantize_layer(W_perm, H_blocks)
         assert q_W.shape == (out_features, in_features)
         assert q_W.min() >= -8
         assert q_W.max() <= 7
@@ -689,7 +692,7 @@ class TestGPTQQuantizeLayerINT8:
         """Quantized values must be in [-128, 127]."""
         W = torch.randn(16, 64)
         H = self._make_hessian(64)
-        q_W, scales = gptq_quantize_layer(W, H, int_bits=8)
+        q_W, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
         assert q_W.min() >= -128
         assert q_W.max() <= 127
 
@@ -697,28 +700,28 @@ class TestGPTQQuantizeLayerINT8:
         """Quantized output should be int8."""
         W = torch.randn(8, 32)
         H = self._make_hessian(32)
-        q_W, scales = gptq_quantize_layer(W, H, int_bits=8)
+        q_W, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
         assert q_W.dtype == torch.int8
 
     def test_scales_shape(self):
         """Scales should have shape [out_features, 1] (per-row)."""
         W = torch.randn(16, 64)
         H = self._make_hessian(64)
-        _, scales = gptq_quantize_layer(W, H, int_bits=8)
+        _, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
         assert scales.shape == (16, 1)
 
     def test_scales_positive(self):
         """All scales must be positive."""
         W = torch.randn(16, 64)
         H = self._make_hessian(64)
-        _, scales = gptq_quantize_layer(W, H, int_bits=8)
+        _, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
         assert torch.all(scales > 0)
 
     def test_no_nan_inf(self):
         """Quantized weights and scales should not contain NaN or Inf."""
         W = torch.randn(16, 64)
         H = self._make_hessian(64)
-        q_W, scales = gptq_quantize_layer(W, H, int_bits=8)
+        q_W, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
         assert not torch.any(torch.isnan(q_W.float()))
         assert not torch.any(torch.isinf(q_W.float()))
         assert not torch.any(torch.isnan(scales))
@@ -728,7 +731,7 @@ class TestGPTQQuantizeLayerINT8:
         """Zero weights should quantize to zero."""
         W = torch.zeros(8, 32)
         H = self._make_hessian(32)
-        q_W, scales = gptq_quantize_layer(W, H, int_bits=8)
+        q_W, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
         assert torch.all(q_W == 0)
 
     def test_gptq_reduces_error_vs_rtn(self):
@@ -741,7 +744,7 @@ class TestGPTQQuantizeLayerINT8:
         X = torch.randn(128, in_features)
         H = X.T @ X
 
-        q_W_gptq, scales_gptq = gptq_quantize_layer(W, H, int_bits=8)
+        q_W_gptq, scales_gptq, _ = gptq_quantize_layer(W, H, int_bits=8)
 
         scales_rtn = calculate_scales_int8(W)
         q_W_rtn = quantize_weights_int8(W, scales_rtn)
@@ -760,7 +763,7 @@ class TestGPTQQuantizeLayerINT8:
         """GPTQ should work with various block sizes."""
         W = torch.randn(8, 128)
         H = self._make_hessian(128)
-        q_W, scales = gptq_quantize_layer(W, H, block_size=32, int_bits=8)
+        q_W, scales, _ = gptq_quantize_layer(W, H, block_size=32, int_bits=8)
         assert q_W.shape == (8, 128)
         assert q_W.min() >= -128
         assert q_W.max() <= 127
@@ -770,7 +773,7 @@ class TestGPTQQuantizeLayerINT8:
         W = torch.randn(8, 32)
         H = torch.zeros(32, 32)
         H[0, 0] = 1.0
-        q_W, scales = gptq_quantize_layer(W, H, damping=0.1, int_bits=8)
+        q_W, scales, _ = gptq_quantize_layer(W, H, damping=0.1, int_bits=8)
         assert q_W.shape == (8, 32)
         assert not torch.any(torch.isnan(q_W.float()))
 
@@ -847,7 +850,7 @@ class TestGPTQIntegrationINT8:
         X = torch.randn(64, in_features)
         H = X.T @ X
 
-        q_W, scales = gptq_quantize_layer(W_rot, H, int_bits=8)
+        q_W, scales, _ = gptq_quantize_layer(W_rot, H, int_bits=8)
 
         assert q_W.shape == (out_features, in_features)
         assert scales.shape == (out_features, 1)
@@ -872,7 +875,7 @@ class TestGPTQIntegrationINT8:
         X = torch.randn(64, in_features)
         H = X.T @ X
 
-        q_W, scales = gptq_quantize_layer(W_rot, H, block_size=64, int_bits=8)
+        q_W, scales, _ = gptq_quantize_layer(W_rot, H, block_size=64, int_bits=8)
 
         assert q_W.shape[0] == out_features
         assert q_W.dtype == torch.int8
