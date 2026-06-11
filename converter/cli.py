@@ -216,8 +216,7 @@ def quantize_model(
                 cal_perm = get_permutation(calibration, layer_name)
 
             if cal_perm is not None:
-                # Calibration permutation: apply to weight only.
-                # Hessian is already in permuted space from calibration.
+                # Apply calibration permutation to weight only (Hessian already permuted).
                 orig_features = min(orig_in_features, cal_perm.shape[0])
                 perm_slice = cal_perm[:orig_features]
                 if (perm_slice.max() < orig_features
@@ -262,6 +261,16 @@ def quantize_model(
 
             if hessian is not None:
                 already_rotated = calibration.get("metadata", {}).get("hessian_rotated", False)
+                cal_rot_size = calibration.get("metadata", {}).get("rot_size", 0)
+
+                # If the calibration was rotated with a different rot_size
+                # than the converter is using, the Hessian is in the wrong
+                # space.  We can't re-rotate from the original space, but
+                # we should warn the user.
+                if already_rotated and cal_rot_size and int(cal_rot_size) != rot_size:
+                    print(f"  WARNING: calibration rot_size={cal_rot_size} != converter rot_size={rot_size}. "
+                          f"Hessian is in the wrong rotation space. "
+                          f"Re-run calibration with rot_size={rot_size} for best results.")
 
                 if not already_rotated:
                     if cal_perm is not None:
@@ -282,10 +291,7 @@ def quantize_model(
                     if rot_size > 0:
                         hessian = rotate_hessian(hessian, rot_size)
 
-                # Re-permute only when we computed our own permutation
-                # (cal_perm is None).  When calibration provides the
-                # permutation the un-permute + rotate already produced
-                # the correct Hessian for the permuted-rotated weight.
+                # Re-permute only for self-computed permutations.
                 if perm_applied and cal_perm is None:
                     if hessian.dim() == 2:
                         hessian = hessian[perm_orig][:, perm_orig]
@@ -297,10 +303,7 @@ def quantize_model(
                             f"with the permutation applied."
                         )
 
-                # Quantize the full rotated weight (no truncation).
-                # If rotation padded the weight, the padded columns will have
-                # zero Hessian diagonal — damping prevents div-by-zero, and
-                # error compensation naturally skips zero-energy columns.
+                # Quantize full rotated weight; zero-energy padded columns handled by damping.
                 quantized_W, scales, zero_points = gptq_quantize_layer(
                     W_work, hessian,
                     block_size=gptq_block_size,
@@ -379,6 +382,11 @@ def quantize_model(
         print(f"  MSE={mse:.6f}  max_err={max_err:.4f}  scale_range=[{scales.min():.6f}, {scales.max():.6f}]  bad_scales={bad_scales}")
         if bad_scales:
             print(f"  WARNING: bad scales detected! inf={scales.isinf().any()} nan={scales.isnan().any()} zero={(scales == 0).any()}")
+            # Recompute scales from the quantized weights as a safety fallback
+            fix_scales = (quantized_W.float().abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-6, max=65000.0).to(torch.float16)
+            n_bad = scales.isinf().sum() + scales.isnan().sum() + (scales == 0).sum()
+            scales = torch.where(scales.isinf() | scales.isnan() | (scales == 0), fix_scales, scales)
+            print(f"  FIXED: replaced {n_bad} bad scale values")
 
         # Store weights and scales
         output_dict[name] = stored_weights
@@ -440,8 +448,10 @@ def main() -> None:
     )
     parser.add_argument("-i", "--input", required=True, help="Input safetensors file")
     parser.add_argument("-o", "--output", required=True, help="Output directory")
-    parser.add_argument("--rot-size", type=int, default=0, choices=[0, 16, 64, 256],
-                        help="Regular Hadamard group size (0=no rotation, default: 0)")
+    parser.add_argument("--rot-size", type=int, default=0,
+                        help="Regular Hadamard group size (0=no rotation, power of 4 for "
+                             "Regular Hadamard, any power of 2 for Sylvester fallback. "
+                             "Default: 0)")
     parser.add_argument("--int-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bit-width: 4 (INT4) or 8 (INT8, default: 4)")
     parser.add_argument("--group-size", type=int, default=128,
@@ -474,6 +484,9 @@ def main() -> None:
                              "e.g. '0.8,0.85,0.9,0.95,1.0'. Smaller ratios clip outliers for finer resolution.")
 
     args = parser.parse_args()
+
+    if args.rot_size != 0 and (args.rot_size & (args.rot_size - 1)) != 0:
+        parser.error(f"--rot-size must be 0 or a power of 2, got {args.rot_size}")
 
     skip_patterns = None
     if args.skip_patterns:

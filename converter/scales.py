@@ -11,6 +11,7 @@ import torch
 
 INT4_SCALE_DIVISOR = 7.0
 INT8_SCALE_DIVISOR = 127.0
+MAX_FP16_SCALE = 65000.0
 
 
 def _pad_to_group_size(W: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -45,14 +46,14 @@ def calculate_scales(W: torch.Tensor, group_size: int = 128,
     max_vals = W_grouped.abs().amax(dim=2)
 
     if clipping_ratios is None:
-        scales = (max_vals.float() / INT4_SCALE_DIVISOR).clamp(min=1e-6).to(torch.float16)
+        scales = (max_vals.float() / INT4_SCALE_DIVISOR).clamp(min=1e-6, max=MAX_FP16_SCALE).to(torch.float16)
         return scales
 
     # Clipping ratio search: try each ratio, compute MSE per group, pick best
     best_scales = None
     best_mse = None
     for ratio in clipping_ratios:
-        candidate_scales = (max_vals.float() * ratio / INT4_SCALE_DIVISOR).clamp(min=1e-6)
+        candidate_scales = (max_vals.float() * ratio / INT4_SCALE_DIVISOR).clamp(min=1e-6, max=MAX_FP16_SCALE)
         q = (W_grouped / candidate_scales.unsqueeze(2)).round().clamp(-8, 7)
         dequant = q * candidate_scales.unsqueeze(2)
         mse = (W_grouped - dequant).pow(2).mean(dim=2)
@@ -108,7 +109,7 @@ def calculate_scales_int8(W: torch.Tensor,
     max_vals = W.abs().amax(dim=1, keepdim=True)
 
     if clipping_ratios is None:
-        scales = (max_vals.float() / INT8_SCALE_DIVISOR).clamp(min=1e-6).to(torch.float16)
+        scales = (max_vals.float() / INT8_SCALE_DIVISOR).clamp(min=1e-6, max=MAX_FP16_SCALE).to(torch.float16)
         return scales
 
     # Clipping ratio search
@@ -116,7 +117,7 @@ def calculate_scales_int8(W: torch.Tensor,
     best_mse = None
     W_3d = W.unsqueeze(1)  # [out, 1, in]
     for ratio in clipping_ratios:
-        candidate_scales = (max_vals.float() * ratio / INT8_SCALE_DIVISOR).clamp(min=1e-6)
+        candidate_scales = (max_vals.float() * ratio / INT8_SCALE_DIVISOR).clamp(min=1e-6, max=MAX_FP16_SCALE)
         q = (W_3d / candidate_scales.unsqueeze(2)).round().clamp(-128, 127)
         dequant = q * candidate_scales.unsqueeze(2)
         mse = (W_3d - dequant).pow(2).mean(dim=2)
@@ -148,19 +149,7 @@ def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     return W_rounded.to(torch.int8)
 
 
-# ---------------------------------------------------------------------------
-# Asymmetric quantization
-# ---------------------------------------------------------------------------
-# Asymmetric quantization uses a scale + zero-point per group, mapping the
-# full [min, max] range onto the integer grid instead of centering at zero.
-# This avoids wasting levels when the distribution is skewed.
-#
-# For signed INT4 in [-8, 7]:
-#   scale   = (max - min) / 15
-#   zp      = -8 - round(min / scale)
-#   quant   = round(W / scale + zp).clamp(-8, 7)
-#   dequant = (quant - zp) * scale
-# ---------------------------------------------------------------------------
+# --- Asymmetric quantization (scale + zero-point per group) ---
 
 
 def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
@@ -190,7 +179,7 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
     w_max = W_grouped.amax(dim=2)
 
     if clipping_ratios is None:
-        scales = ((w_max - w_min).float() / 15.0).clamp(min=1e-6)
+        scales = ((w_max - w_min).float() / 15.0).clamp(min=1e-6, max=MAX_FP16_SCALE)
         zero_points = (-8 - torch.round(w_min / scales)).clamp(-8, 7)
         # Zero groups: set zp to 0 so zero maps to zero
         zero_groups = (w_min == 0) & (w_max == 0)
@@ -203,7 +192,7 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
     best_mse = None
     for ratio in clipping_ratios:
         range_vals = (w_max - w_min).float() * ratio
-        candidate_scales = (range_vals / 15.0).clamp(min=1e-6)
+        candidate_scales = (range_vals / 15.0).clamp(min=1e-6, max=MAX_FP16_SCALE)
         candidate_zp = (-8 - torch.round(w_min / candidate_scales)).clamp(-8, 7)
         q = (W_grouped / candidate_scales.unsqueeze(2)
              + candidate_zp.unsqueeze(2)).round().clamp(-8, 7)
@@ -275,7 +264,7 @@ def calculate_scales_int8_asymmetric(
     w_max = W.amax(dim=1, keepdim=True)
 
     if clipping_ratios is None:
-        scales = ((w_max - w_min).float() / 255.0).clamp(min=1e-6)
+        scales = ((w_max - w_min).float() / 255.0).clamp(min=1e-6, max=MAX_FP16_SCALE)
         zero_points = (-128 - torch.round(w_min / scales)).clamp(-128, 127)
         return scales.to(torch.float16), zero_points.to(torch.int16)
 
@@ -286,7 +275,7 @@ def calculate_scales_int8_asymmetric(
     W_3d = W.unsqueeze(1)  # [out, 1, in]
     for ratio in clipping_ratios:
         range_vals = (w_max - w_min).float() * ratio
-        candidate_scales = (range_vals / 255.0).clamp(min=1e-6)
+        candidate_scales = (range_vals / 255.0).clamp(min=1e-6, max=MAX_FP16_SCALE)
         candidate_zp = (-128 - torch.round(w_min / candidate_scales)).clamp(-128, 127)
         q = (W_3d / candidate_scales.unsqueeze(2)
              + candidate_zp.unsqueeze(2)).round().clamp(-128, 127)

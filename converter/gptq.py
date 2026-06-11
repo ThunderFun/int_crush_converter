@@ -205,6 +205,10 @@ def gptq_quantize_layer(
     else:
         raise ValueError(f"Expected 2D or 3D Hessian, got {hessian.dim()}D")
 
+    # Clamp scales to safe fp16 range (prevent div-by-zero and overflow).
+    MAX_FP16_SCALE = 65000.0
+    row_scales = row_scales.clamp(min=1e-6, max=MAX_FP16_SCALE)
+
     accel = "Triton" if used_triton else "PyTorch"
     print(f"    GPTQ: {accel} path, {out_features}x{in_features}, block_size={block_size}")
 

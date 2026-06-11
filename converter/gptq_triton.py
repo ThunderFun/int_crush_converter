@@ -150,6 +150,15 @@ def gptq_loop_triton(
 
     BLOCK_ROWS = 64
 
+    # When HAS_ZP is False the kernel never reads zp_ptr, but passing
+    # the same tensor for both scale_ptr and zp_ptr can cause
+    # speculative reads on some GPUs that corrupt the scale data.
+    # Always pass a distinct dummy buffer for zp when it is unused.
+    if not has_zp:
+        zp_dummy = torch.zeros(M, device=W_work.device, dtype=torch.float32)
+    else:
+        zp_dummy = None
+
     for i1 in range(0, N, block_size):
         i2 = min(i1 + block_size, N)
         block_count = i2 - i1
@@ -159,7 +168,7 @@ def gptq_loop_triton(
 
         grid = (triton.cdiv(M, BLOCK_ROWS),)
         _gptq_block_kernel[grid](
-            W_work, row_scales, zp_gpu if has_zp else row_scales,
+            W_work, row_scales, zp_gpu if has_zp else zp_dummy,
             Hinv_block, Q_out, err_accum,
             M, W_work.shape[1], Q_out.shape[1], i1,
             block_count, Hinv_block.shape[1],
