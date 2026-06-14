@@ -2,6 +2,8 @@
 
 import torch
 
+from .log import logger
+
 
 def load_calibration(path: str) -> dict:
     """Load a calibration .pt file and validate its structure.
@@ -13,9 +15,18 @@ def load_calibration(path: str) -> dict:
         Calibration dict with keys: metadata, hessians, amax, shapes, layer_types
 
     Raises:
+        FileNotFoundError: If the file does not exist
+        ValueError: If the file is corrupted or not a valid .pt file
         KeyError: If required keys are missing
     """
-    data = torch.load(path, map_location="cpu", weights_only=True)
+    try:
+        data = torch.load(path, map_location="cpu", weights_only=True)
+    except FileNotFoundError:
+        raise ValueError(f"Calibration file not found: {path}")
+    except Exception as e:
+        raise ValueError(
+            f"Calibration file at {path} is corrupted or not a valid .pt file: {e}"
+        ) from e
 
     required_keys = {"hessians", "shapes", "layer_types"}
     missing = required_keys - set(data.keys())
@@ -76,7 +87,7 @@ def get_hessian(calibration: dict, layer_name: str, weight_shape: torch.Size) ->
 
     H_raw = hessians[layer_name]
 
-    # ── list-of-blocks format (ComfyUI-GPTQ-Calibration) ──────────────
+    # --- list-of-blocks format (ComfyUI-GPTQ-Calibration) --------
     if isinstance(H_raw, list):
         if not H_raw or not isinstance(H_raw[0], torch.Tensor):
             return None
@@ -100,12 +111,18 @@ def get_hessian(calibration: dict, layer_name: str, weight_shape: torch.Size) ->
     if H.dim() == 2:
         if H.shape[0] != in_features or H.shape[1] != in_features:
             return None
+        if not torch.isfinite(H).all():
+            logger.warning("Hessian for %s contains non-finite values; skipping (RTN fallback)", layer_name)
+            return None
         return H
 
     if H.dim() == 3:
         num_blocks, block_size, _ = H.shape
         expected_blocks = (in_features + block_size - 1) // block_size
         if num_blocks != expected_blocks or block_size != H.shape[2]:
+            return None
+        if not torch.isfinite(H).all():
+            logger.warning("Hessian for %s contains non-finite values; skipping (RTN fallback)", layer_name)
             return None
         return H
     return None

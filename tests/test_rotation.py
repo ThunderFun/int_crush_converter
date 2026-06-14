@@ -4,9 +4,11 @@ import math
 import torch
 import pytest
 
+import converter.rotation as rotation_mod
 from converter.rotation import (
     _is_power_of_four,
     make_hadamard_regular,
+    make_hadamard_sylvester,
     get_hadamard,
     rotate_weights,
     rotate_activations,

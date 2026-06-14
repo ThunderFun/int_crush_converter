@@ -202,13 +202,19 @@ class TestGPTQScaleClipping:
     def test_gptq_int4_scales_finite(self):
         W = torch.randn(16, 64)
         H = _make_hessian(64)
-        _, scales, _ = gptq_quantize_layer(W, H, int_bits=4)
+        _qr = gptq_quantize_layer(W, H, int_bits=4)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert _all_finite_fp16(scales)
 
     def test_gptq_int8_scales_finite(self):
         W = torch.randn(16, 64)
         H = _make_hessian(64)
-        _, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
+        _qr = gptq_quantize_layer(W, H, int_bits=8)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert _all_finite_fp16(scales)
 
     def test_gptq_block_diagonal_scales_finite(self):
@@ -220,7 +226,10 @@ class TestGPTQScaleClipping:
             X = torch.randn(64, 32)
             blocks.append(X.T @ X)
         H = torch.stack(blocks)
-        _, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
+        _qr = gptq_quantize_layer(W, H, int_bits=8)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert _all_finite_fp16(scales)
 
     def test_gptq_ill_conditioned_hessian_scales_finite(self):
@@ -228,44 +237,65 @@ class TestGPTQScaleClipping:
         W = torch.randn(8, 32)
         H = torch.zeros(32, 32)
         H[0, 0] = 1.0
-        _, scales, _ = gptq_quantize_layer(W, H, int_bits=8, damping=0.1)
+        _qr = gptq_quantize_layer(W, H, int_bits=8, damping=0.1)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert _all_finite_fp16(scales)
 
     def test_gptq_zero_weights_scales_finite(self):
         W = torch.zeros(8, 32)
         H = _make_hessian(32)
-        _, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
+        _qr = gptq_quantize_layer(W, H, int_bits=8)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert _all_finite_fp16(scales)
 
     def test_rtn_int4_scales_finite(self):
         W = torch.randn(16, 64)
-        _, scales = gptq_quantize_layer_rtn(W, int_bits=4)
+        _qr = gptq_quantize_layer_rtn(W, int_bits=4)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert _all_finite_fp16(scales)
 
     def test_rtn_int8_scales_finite(self):
         W = torch.randn(16, 64)
-        _, scales = gptq_quantize_layer_rtn(W, int_bits=8)
+        _qr = gptq_quantize_layer_rtn(W, int_bits=8)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert _all_finite_fp16(scales)
 
     def test_rtn_with_clipping_ratios_scales_finite(self):
         W = torch.randn(16, 64)
-        _, scales = gptq_quantize_layer_rtn(
+        _qr = gptq_quantize_layer_rtn(
             W, int_bits=8, clipping_ratios=[0.8, 0.85, 0.9, 0.95, 1.0]
         )
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert _all_finite_fp16(scales)
 
     def test_gptq_scales_upper_bound(self):
         """GPTQ scales should never exceed MAX_FP16_SCALE."""
         W = torch.randn(16, 64)
         H = _make_hessian(64)
-        _, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
+        _qr = gptq_quantize_layer(W, H, int_bits=8)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert scales.max() <= MAX_FP16_SCALE
 
     def test_gptq_scales_lower_bound(self):
         """GPTQ scales should never be zero or negative."""
         W = torch.randn(16, 64)
         H = _make_hessian(64)
-        _, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
+        _qr = gptq_quantize_layer(W, H, int_bits=8)
+        _ = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert scales.min() > 0
 
 
@@ -274,65 +304,119 @@ class TestGPTQScaleClipping:
 # ---------------------------------------------------------------------------
 
 class TestScaleValidationFallback:
-    """Verify that the CLI's validation + recompute fallback works."""
+    """Verify that the CLI's validation + recompute fallback works.
+
+    The actual pipeline (pipeline.py:417) computes replacement scales from
+    W_work, not from quantized_W. This test suite matches that logic.
+    """
 
     @staticmethod
-    def _simulate_validation(quantized_W, scales):
-        """Reproduce the CLI's validation logic."""
+    def _simulate_validation(W_work, scales, int_bits=8):
+        """Reproduce the pipeline's scale-repair logic (symmetric path only).
+
+        Matches pipeline.py:416-417:
+            sym_scales = (W_work.float().abs().amax(dim=1, keepdim=True) / fix_divisor)
+        """
+        from converter.config import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, FP16_SCALE_FLOOR, MAX_FP16_SCALE
+        divisor = INT8_SCALE_DIVISOR if int_bits == 8 else INT4_SCALE_DIVISOR
         bad = scales.isinf() | scales.isnan() | (scales == 0)
         if bad.any():
-            fix = (quantized_W.float().abs().amax(dim=1, keepdim=True) / 127.0
-                   ).clamp(min=1e-6, max=65000.0).to(torch.float16)
+            fix = (W_work.float().abs().amax(dim=1, keepdim=True) / divisor
+                   ).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
             scales = torch.where(bad, fix, scales)
         return scales
 
     def test_inf_scale_replaced(self):
         """An Inf scale should be replaced by the fallback."""
-        quantized_W = torch.randint(-128, 127, (4, 64), dtype=torch.int8)
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
         scales = torch.tensor([[0.001], [float('inf')], [0.002], [0.003]],
                               dtype=torch.float16)
-        fixed = self._simulate_validation(quantized_W, scales)
+        fixed = self._simulate_validation(W_work, scales)
         assert _all_finite_fp16(fixed)
         assert fixed[0] == scales[0]  # untouched
         assert fixed[1] != float('inf')  # replaced
 
     def test_nan_scale_replaced(self):
-        quantized_W = torch.randint(-128, 127, (4, 64), dtype=torch.int8)
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
         scales = torch.tensor([[0.001], [float('nan')], [0.002], [0.003]],
                               dtype=torch.float16)
-        fixed = self._simulate_validation(quantized_W, scales)
+        fixed = self._simulate_validation(W_work, scales)
         assert _all_finite_fp16(fixed)
 
     def test_zero_scale_replaced(self):
-        quantized_W = torch.randint(-128, 127, (4, 64), dtype=torch.int8)
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
         scales = torch.tensor([[0.001], [0.0], [0.002], [0.003]],
                               dtype=torch.float16)
-        fixed = self._simulate_validation(quantized_W, scales)
+        fixed = self._simulate_validation(W_work, scales)
         assert _all_finite_fp16(fixed)
         assert fixed[1] > 0
 
     def test_all_good_scales_unchanged(self):
         """If all scales are valid, the fallback should not modify them."""
-        quantized_W = torch.randint(-128, 127, (4, 64), dtype=torch.int8)
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
         scales = torch.tensor([[0.001], [0.002], [0.003], [0.004]],
                               dtype=torch.float16)
-        fixed = self._simulate_validation(quantized_W, scales)
+        fixed = self._simulate_validation(W_work, scales)
         assert torch.equal(fixed, scales)
 
     def test_multiple_bad_scales(self):
         """Multiple bad scales should all be replaced."""
-        quantized_W = torch.randint(-128, 127, (4, 64), dtype=torch.int8)
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
         scales = torch.tensor([[float('inf')], [float('nan')], [0.0], [0.003]],
                               dtype=torch.float16)
-        fixed = self._simulate_validation(quantized_W, scales)
+        fixed = self._simulate_validation(W_work, scales)
         assert _all_finite_fp16(fixed)
         assert fixed[3] == scales[3]  # only good one untouched
+
+    def test_int4_repair_scale_magnitude(self):
+        """INT4 repair scales from W_work should be proportional to
+        max|W|/7.0, not bounded by max|Q|/7.0 ≈ 1.14."""
+        torch.manual_seed(0)
+        # Large weights → correct repaired scale >> 1.0
+        W_work = torch.randn(4, 64) * 30.0
+        scales = torch.tensor([[float('inf')], [1.0], [0.0], [0.5]], dtype=torch.float16)
+
+        fixed = self._simulate_validation(W_work, scales, int_bits=4)
+
+        # Row 0 (Inf): repaired scale = max|W| / 7.0 — should be large
+        assert fixed[0].item() > 2.0, (
+            f"INT4 repaired scale from W_work should be >> 1.0, "
+            f"got {fixed[0].item():.2f}"
+        )
+        # Row 2 (0.0): same repair — also large
+        assert fixed[2].item() > 2.0
+        # Good rows untouched
+        assert fixed[1].item() == 1.0
+        assert fixed[3].item() == 0.5
+
+    def test_int8_repair_scale_magnitude(self):
+        """INT8 repair scales from W_work should be proportional to
+        max|W|/127.0, not bounded by max|Q|/127.0 ≈ 1.0."""
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 500.0
+        scales = torch.tensor([[float('inf')], [1.0], [0.0], [0.5]], dtype=torch.float16)
+
+        fixed = self._simulate_validation(W_work, scales, int_bits=8)
+
+        # Row 0 (Inf): repaired scale = max|W| / 127.0 — should be large
+        assert fixed[0].item() > 2.0, (
+            f"INT8 repaired scale from W_work should be >> 1.0, "
+            f"got {fixed[0].item():.2f}"
+        )
+        assert fixed[1].item() == 1.0
+        assert fixed[3].item() == 0.5
 
 
 # ---------------------------------------------------------------------------
 # Stress test: repeated quantization (simulates non-deterministic bug)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 class TestRepeatedQuantization:
     """Run quantization many times to catch rare non-deterministic failures."""
 
@@ -343,7 +427,10 @@ class TestRepeatedQuantization:
         X = torch.randn(64, 64)
         H = X.T @ X
         for i in range(100):
-            _, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
+            _qr = gptq_quantize_layer(W, H, int_bits=8)
+            _ = _qr.quantized_W
+            scales = _qr.scales
+            zero_points = _qr.zero_points
             assert _all_finite_fp16(scales), f"Inf/NaN in run {i}"
 
     def test_int8_rtn_scales_always_finite(self):
@@ -351,7 +438,10 @@ class TestRepeatedQuantization:
         torch.manual_seed(42)
         W = torch.randn(16, 64)
         for i in range(100):
-            _, scales = gptq_quantize_layer_rtn(W, int_bits=8)
+            _qr = gptq_quantize_layer_rtn(W, int_bits=8)
+            _ = _qr.quantized_W
+            scales = _qr.scales
+            zero_points = _qr.zero_points
             assert _all_finite_fp16(scales), f"Inf/NaN in run {i}"
 
     def test_int8_rtn_with_clipping_always_finite(self):
@@ -359,9 +449,12 @@ class TestRepeatedQuantization:
         torch.manual_seed(42)
         W = torch.randn(16, 64)
         for i in range(100):
-            _, scales = gptq_quantize_layer_rtn(
+            _qr = gptq_quantize_layer_rtn(
                 W, int_bits=8, clipping_ratios=[0.8, 0.85, 0.9, 0.95, 1.0]
             )
+            _ = _qr.quantized_W
+            scales = _qr.scales
+            zero_points = _qr.zero_points
             assert _all_finite_fp16(scales), f"Inf/NaN in run {i}"
 
 

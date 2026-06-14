@@ -3,6 +3,7 @@
 import torch
 
 from converter.scales import (
+    _search_clipping_ratio,
     calculate_scales,
     quantize_weights,
     calculate_scales_int8,
@@ -245,3 +246,108 @@ class TestAsymmetricINT8:
         scales, zps = calculate_scales_int8_asymmetric(W, clipping_ratios=[0.9, 0.95, 1.0])
         assert scales.shape == (16, 1)
         assert torch.all(scales > 0)
+
+
+# ---------------------------------------------------------------------------
+# _search_clipping_ratio (shared helper)
+# ---------------------------------------------------------------------------
+
+
+class TestSearchClippingRatio:
+    def test_single_ratio_returns_scales(self):
+        """With a single ratio, the returned scales should be from that ratio."""
+        torch.manual_seed(42)
+        W = torch.randn(4, 16)
+        max_vals = W.abs().amax(dim=1, keepdim=True)
+
+        def _compute(ratio):
+            scales = (max_vals.float() * ratio / 7.0).clamp(min=1e-8, max=65504.0)
+            q = (W.unsqueeze(1) / scales.unsqueeze(2)).round().clamp(-8, 7)
+            dequant = q * scales.unsqueeze(2)
+            mse = (W.unsqueeze(1) - dequant).pow(2).mean(dim=2)
+            return scales, None, mse
+
+        best_scales, best_zp = _search_clipping_ratio([1.0], _compute)
+        assert best_zp is None
+        assert best_scales.shape == (4, 1)
+
+    def test_picks_best_ratio(self):
+        """With multiple ratios, the helper should pick the best ratio per row."""
+        torch.manual_seed(42)
+        W = torch.randn(4, 32)
+        max_vals = W.abs().amax(dim=1, keepdim=True)
+
+        # Compute scales with each ratio individually
+        ratios = [0.8, 0.9, 1.0]
+        per_ratio_mse = []
+        for ratio in ratios:
+            scales = (max_vals.float() * ratio / 7.0).clamp(min=1e-8, max=65504.0)
+            q = (W.unsqueeze(1) / scales.unsqueeze(2)).round().clamp(-8, 7)
+            dequant = q * scales.unsqueeze(2)
+            mse = (W.unsqueeze(1) - dequant).pow(2).mean(dim=2)
+            per_ratio_mse.append(mse)
+
+        def _compute(ratio):
+            scales = (max_vals.float() * ratio / 7.0).clamp(min=1e-8, max=65504.0)
+            q = (W.unsqueeze(1) / scales.unsqueeze(2)).round().clamp(-8, 7)
+            dequant = q * scales.unsqueeze(2)
+            mse = (W.unsqueeze(1) - dequant).pow(2).mean(dim=2)
+            return scales, None, mse
+
+        best_scales, _ = _search_clipping_ratio(ratios, _compute)
+
+        # The best MSE per-row from the helper should match the minimum across ratios
+        W_3d = W.unsqueeze(1)
+        best_q = (W_3d / best_scales.unsqueeze(2)).round().clamp(-8, 7)
+        best_dequant = best_q * best_scales.unsqueeze(2)
+        best_mse = (W_3d - best_dequant).pow(2).mean(dim=2)
+
+        # For each row, the MSE should be <= the MSE from any single ratio
+        for i in range(W.shape[0]):
+            for r_mse in per_ratio_mse:
+                assert best_mse[i] <= r_mse[i] + 1e-6
+
+    def test_with_zero_points(self):
+        """Asymmetric variant: zp should be tracked and returned."""
+        torch.manual_seed(42)
+        W = torch.randn(4, 32)
+        w_min = W.amin(dim=1, keepdim=True)
+        w_max = W.amax(dim=1, keepdim=True)
+
+        def _compute(ratio):
+            range_vals = (w_max - w_min).float() * ratio
+            scales = (range_vals / 15.0).clamp(min=1e-8, max=65504.0)
+            zp = (-8 - torch.round(w_min / scales)).clamp(-8, 7)
+            q = (W.unsqueeze(1) / scales.unsqueeze(2) + zp.unsqueeze(2)).round().clamp(-8, 7)
+            dequant = (q - zp.unsqueeze(2)) * scales.unsqueeze(2)
+            mse = (W.unsqueeze(1) - dequant).pow(2).mean(dim=2)
+            return scales, zp, mse
+
+        best_scales, best_zp = _search_clipping_ratio([0.9, 1.0], _compute)
+        assert best_zp is not None
+        assert best_scales.shape == (4, 1)
+        assert best_zp.shape == (4, 1)
+
+    def test_mse_never_increases_with_more_ratios(self):
+        """Adding more ratios should never increase best MSE."""
+        torch.manual_seed(42)
+        W = torch.randn(4, 32)
+        max_vals = W.abs().amax(dim=1, keepdim=True)
+
+        def _compute(ratio):
+            scales = (max_vals.float() * ratio / 7.0).clamp(min=1e-8, max=65504.0)
+            q = (W.unsqueeze(1) / scales.unsqueeze(2)).round().clamp(-8, 7)
+            dequant = q * scales.unsqueeze(2)
+            mse = (W.unsqueeze(1) - dequant).pow(2).mean(dim=2)
+            return scales, None, mse
+
+        scales_1, _ = _search_clipping_ratio([1.0], _compute)
+        scales_3, _ = _search_clipping_ratio([0.8, 0.9, 1.0], _compute)
+
+        q1 = (W.unsqueeze(1) / scales_1.unsqueeze(2)).round().clamp(-8, 7)
+        mse1 = (W.unsqueeze(1) - q1 * scales_1.unsqueeze(2)).pow(2).mean()
+
+        q3 = (W.unsqueeze(1) / scales_3.unsqueeze(2)).round().clamp(-8, 7)
+        mse3 = (W.unsqueeze(1) - q3 * scales_3.unsqueeze(2)).pow(2).mean()
+
+        assert mse3 <= mse1 + 1e-6

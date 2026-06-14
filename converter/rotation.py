@@ -50,6 +50,10 @@ def make_hadamard_regular(n: int, dtype: torch.dtype = torch.float16, device: st
     if not _is_power_of_four(n):
         raise ValueError(f"Regular Hadamard requires power of 4, got {n}. Use rot_size=16/64/256.")
 
+    # The 4×4 regular Hadamard kernel H_4 below is the matrix from
+    # ConvRot (Ashkboos et al., arXiv:2512.03673), Theorem 3.2.
+    # Each row sums to +1 (after the /2 normalisation), guaranteeing
+    # the equal-row-sum property that defines a *regular* Hadamard matrix.
     H4 = torch.tensor([
         [ 1.0,  1.0,  1.0, -1.0],
         [ 1.0,  1.0, -1.0,  1.0],
@@ -70,6 +74,15 @@ def get_hadamard(size: int, dtype: torch.dtype = torch.float16, device: str = "c
     if key not in _hadamard_cache:
         _hadamard_cache[key] = make_hadamard_regular(size, dtype=dtype, device=device)
     return _hadamard_cache[key]
+
+
+def clear_hadamard_cache() -> None:
+    """Free all cached Hadamard matrices.
+
+    Call between ``quantize_model()`` invocations to prevent unbounded
+    memory growth when quantizing multiple models in one process.
+    """
+    _hadamard_cache.clear()
 
 
 def _apply_hadamard(x: torch.Tensor, rot_size: int) -> torch.Tensor:
@@ -176,7 +189,6 @@ def rotate_hessian(H: torch.Tensor, rot_size: int) -> torch.Tensor:
             raise ValueError(f"Expected square Hessian, got {H.shape}")
 
         # Pad symmetrically if dimension is not divisible by rot_size
-        pad = 0
         if in_features % rot_size != 0:
             pad = rot_size - (in_features % rot_size)
             H = F.pad(H, (0, pad, 0, pad))
@@ -189,9 +201,9 @@ def rotate_hessian(H: torch.Tensor, rot_size: int) -> torch.Tensor:
         flat = _transform_hessian_blocks(flat, rot_size)
         H_rot = flat.reshape(n_blocks, n_blocks, rot_size, rot_size).permute(0, 2, 1, 3).reshape(in_features, in_features)
 
-        # Crop back to original size if padded
-        if pad > 0:
-            H_rot = H_rot[:in_features - pad, :in_features - pad]
+        # Keep the padded size so H_rot.shape matches the padded weight
+        # matrix produced by rotate_weights().  The padded zero-energy
+        # columns are handled by GPTQ's damping.
         return H_rot
 
     elif H.dim() == 3:

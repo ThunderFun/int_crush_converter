@@ -7,14 +7,16 @@ quantization error to remaining unquantized columns.
 import os
 import torch
 
+from .log import logger
 from .scales import (
-    INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR,
     calculate_scales, quantize_weights,
     calculate_scales_int8, quantize_weights_int8,
     calculate_scales_asymmetric, quantize_weights_asymmetric,
     calculate_scales_int8_asymmetric, quantize_weights_int8_asymmetric,
 )
-from .rounding import _invert_hessian, _gptq_block
+from .config import DIAG_MEAN_FLOOR, SCALE_FLOOR, FP16_SCALE_FLOOR, MAX_FP16_SCALE, INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
+from .rounding import _invert_hessian, _gptq_block, _round_half_away_from_zero
+from .types import QuantizationResult
 from .gptq_triton import gptq_loop_triton, _HAS_GPTQ_TRITON
 
 _DISABLE_TRITON = os.environ.get("GPTQ_DISABLE_TRITON", "0") == "1"
@@ -79,9 +81,59 @@ def _gptq_block_triton(
             quantized_W[:, col_start:col_start + n_cols] = Q_gpu.to(quantized_W.device)
             return True
         return False
-    except Exception as e:
-        print(f"    GPTQ Triton fallback: {e}")
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        logger.debug("GPTQ Triton fallback: %s", e)
         return False
+
+
+def _prepare_hessian(
+    H_block: torch.Tensor,
+    damping: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute Cholesky of H⁻¹ per GPTQ paper Algorithm 1.
+
+    Intuition for *why* H⁻¹ and not H: the GPTQ column-update rule
+    needs the inverse Hessian to compute δ = −H⁻¹[:,j] · err / H⁻¹[j,j].
+    Rather than forming the full dense H⁻¹, Algorithm 1 (Frantar et al.,
+    arXiv:2210.17323) stores only Cholesky(H⁻¹) and recovers individual
+    columns of H⁻¹ via forward-solve — O(n²) per column instead of O(n³).
+    The upper-triangular factor L.T is cached here; the per-column
+    extraction happens in the main loop below.
+    Falls back to full inverse if Cholesky fails (non-positive-definite H⁻¹).
+    """
+    diag_mean = H_block.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
+    H_damped = H_block + damping * diag_mean * torch.eye(H_block.shape[0], dtype=torch.float32)
+    H_inv = _invert_hessian(H_damped)
+    try:
+        L = torch.linalg.cholesky(H_inv)
+        return L.T.to(device)  # upper triangular
+    except torch.linalg.LinAlgError:
+        return H_inv.to(device)
+
+
+def _prepare_hinv(
+    H_block: torch.Tensor,
+    damping: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the true inverse Hessian (no Cholesky decomposition).
+
+    This is the production implementation used by default via
+    ``_gptq_prepare_hessian``.  Unlike the legacy :func:`_prepare_hessian`
+    (which stores only the Cholesky factor), this returns the full H⁻¹
+    so that column extraction is a simple slice rather than a forward-solve.
+    """
+    diag_mean = H_block.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
+    H_damped = H_block + damping * diag_mean * torch.eye(H_block.shape[0], dtype=torch.float32)
+    return _invert_hessian(H_damped).to(device)
+
+
+# Module-level reference that can be monkey-patched by tests.
+# Default is _prepare_hinv (full inverse H⁻¹ — the production path).
+# Tests can swap this to _prepare_hessian to exercise the legacy
+# Cholesky-based path.
+_gptq_prepare_hessian = _prepare_hinv
 
 
 def gptq_quantize_layer(
@@ -90,7 +142,7 @@ def gptq_quantize_layer(
     block_size: int = 128,
     damping: float = 0.01,
     int_bits: int = 4,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> QuantizationResult:
     """Quantize a weight matrix using GPTQ with per-row asymmetric quantization.
 
     Uses asymmetric quantization (scale + zero-point) to utilize all integer
@@ -108,10 +160,7 @@ def gptq_quantize_layer(
         int_bits: quantization bit-width (4 or 8)
 
     Returns:
-        (quantized_W, scales, zero_points):
-            quantized_W: [out_features, in_features] quantized values as int8
-            scales: [out_features, 1] float16 per-row scales
-            zero_points: [out_features, 1] int8 per-row zero-points (None for INT8)
+        QuantizationResult with quantized_W, scales, zero_points, method_used, and fallbacks.
     """
     if int_bits not in (4, 8):
         raise ValueError(f"int_bits must be 4 or 8, got {int_bits}")
@@ -128,35 +177,20 @@ def gptq_quantize_layer(
         # Asymmetric: scale = (max - min) / 15, zp = -8 - round(min / scale)
         w_min = W.amin(dim=1, keepdim=True)
         w_max = W.amax(dim=1, keepdim=True)
-        row_scales = ((w_max - w_min).float() / 15.0).clamp(min=1e-6)
-        row_zp = (-8 - torch.round(w_min / row_scales)).clamp(-8, 7)
+        row_scales = ((w_max - w_min).float() / 15.0).clamp(min=FP16_SCALE_FLOOR)
+        row_zp = (-8 - _round_half_away_from_zero(w_min / row_scales)).clamp(-8, 7)
         # Zero rows: set zp to 0 so zero maps to zero
         zero_rows = (w_min == 0) & (w_max == 0)
         row_zp = row_zp.masked_fill(zero_rows, 0)
         row_zp_int8 = row_zp.to(torch.int8)
     else:
         # INT8: keep symmetric (scale = max / 127)
-        row_scales = (W.abs().amax(dim=1, keepdim=True) / INT8_SCALE_DIVISOR).clamp(min=1e-6)
+        row_scales = (W.abs().amax(dim=1, keepdim=True) / INT8_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR)
         row_zp_int8 = None
 
     quantized_W = torch.zeros_like(W, dtype=torch.int8)
     W_work = W.clone()
     used_triton = False
-
-    def _prepare_hessian(H_block: torch.Tensor) -> torch.Tensor:
-        """Compute Cholesky of H⁻¹ per GPTQ paper Algorithm 1.
-
-        The paper replaces H⁻¹ with Cholesky(H⁻¹)ᵀ (upper triangular).
-        Falls back to full inverse if Cholesky fails.
-        """
-        diag_mean = H_block.diagonal().mean().clamp(min=1e-6)
-        H_damped = H_block + damping * diag_mean * torch.eye(H_block.shape[0], dtype=torch.float32)
-        H_inv = _invert_hessian(H_damped)
-        try:
-            L = torch.linalg.cholesky(H_inv)
-            return L.T.to(W.device)  # upper triangular
-        except torch.linalg.LinAlgError:
-            return H_inv.to(W.device)
 
     if hessian.dim() == 3:
         num_blocks, bs, _ = hessian.shape
@@ -166,7 +200,7 @@ def gptq_quantize_layer(
             actual_bs = col_end - col_start
 
             H_block = hessian[bi, :actual_bs, :actual_bs].float()
-            H_chol = _prepare_hessian(H_block)
+            H_chol = _gptq_prepare_hessian(H_block, damping, W.device)
 
             if _gptq_block_triton(
                 W_work, quantized_W, row_scales, H_chol,
@@ -188,7 +222,7 @@ def gptq_quantize_layer(
             )
 
         H = hessian.float()
-        H_chol = _prepare_hessian(H)
+        H_chol = _gptq_prepare_hessian(H, damping, W.device)
 
         if _gptq_block_triton(
             W_work, quantized_W, row_scales, H_chol,
@@ -206,13 +240,31 @@ def gptq_quantize_layer(
         raise ValueError(f"Expected 2D or 3D Hessian, got {hessian.dim()}D")
 
     # Clamp scales to safe fp16 range (prevent div-by-zero and overflow).
-    MAX_FP16_SCALE = 65000.0
-    row_scales = row_scales.clamp(min=1e-6, max=MAX_FP16_SCALE)
+    row_scales = row_scales.clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
 
     accel = "Triton" if used_triton else "PyTorch"
-    print(f"    GPTQ: {accel} path, {out_features}x{in_features}, block_size={block_size}")
+    logger.debug("GPTQ: %s path, %dx%d, block_size=%d", accel, out_features, in_features, block_size)
 
-    return quantized_W, row_scales.to(torch.float16), row_zp_int8
+    # Compute MSE and max error for the result against the *original* weight.
+    # (W_work is mutated in-place by the GPTQ column loop, so using it would
+    # report artificially near-zero error.)
+    dequant = quantized_W.float() * row_scales.float()
+    if row_zp_int8 is not None:
+        dequant = (quantized_W.float() - row_zp_int8.float()) * row_scales.float()
+    mse = (W - dequant).pow(2).mean().item()
+    max_err = (W - dequant).abs().max().item()
+
+    method_used = "gptq_triton" if used_triton else "gptq_pytorch"
+
+    return QuantizationResult(
+        quantized_W=quantized_W,
+        scales=row_scales.to(torch.float16),
+        zero_points=row_zp_int8,
+        mse=mse,
+        max_err=max_err,
+        method_used=method_used,
+        fallbacks=[],
+    )
 
 
 def gptq_quantize_layer_rtn(
@@ -220,7 +272,7 @@ def gptq_quantize_layer_rtn(
     int_bits: int = 4,
     asymmetric: bool = False,
     clipping_ratios: list[float] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> QuantizationResult:
     """Fallback: RTN quantization (no Hessian correction).
 
     Used when calibration data is not available for a layer.
@@ -232,10 +284,12 @@ def gptq_quantize_layer_rtn(
         clipping_ratios: optional list of clipping ratios to search
 
     Returns:
-        (quantized, scales) for symmetric, or (quantized, scales, zero_points) for asymmetric
+        QuantizationResult with quantized_W, scales, zero_points (if asymmetric), method_used.
     """
     if int_bits not in (4, 8):
         raise ValueError(f"int_bits must be 4 or 8, got {int_bits}")
+
+    fallbacks: list[str] = []
 
     if asymmetric:
         if int_bits == 8:
@@ -245,7 +299,20 @@ def gptq_quantize_layer_rtn(
             in_features = W.shape[1]
             scales, zps = calculate_scales_asymmetric(W, in_features, clipping_ratios=clipping_ratios)
             quantized = quantize_weights_asymmetric(W, scales, zps, in_features)
-        return quantized, scales, zps
+
+        dequant = (quantized.float() - zps.float()) * scales.float()
+        mse = (W - dequant).pow(2).mean().item()
+        max_err = (W - dequant).abs().max().item()
+
+        return QuantizationResult(
+            quantized_W=quantized,
+            scales=scales,
+            zero_points=zps,
+            mse=mse,
+            max_err=max_err,
+            method_used="rtn",
+            fallbacks=fallbacks,
+        )
 
     if int_bits == 8:
         scales = calculate_scales_int8(W, clipping_ratios=clipping_ratios)
@@ -254,4 +321,17 @@ def gptq_quantize_layer_rtn(
         in_features = W.shape[1]
         scales = calculate_scales(W, in_features, clipping_ratios=clipping_ratios)
         quantized = quantize_weights(W, scales, in_features)
-    return quantized, scales
+
+    dequant = quantized.float() * scales.float()
+    mse = (W - dequant).pow(2).mean().item()
+    max_err = (W - dequant).abs().max().item()
+
+    return QuantizationResult(
+        quantized_W=quantized,
+        scales=scales,
+        zero_points=None,
+        mse=mse,
+        max_err=max_err,
+        method_used="rtn",
+        fallbacks=fallbacks,
+    )

@@ -13,6 +13,8 @@ import warnings
 
 import torch
 
+from .config import ERR_CLAMP_RANGE, SCALE_FLOOR, SIGN_FLIP_THRESHOLD
+
 
 def _invert_hessian(H: torch.Tensor) -> torch.Tensor:
     """Compute inverse Hessian. Try Cholesky first (numerically stabler), fall back to inv, then pinv."""
@@ -86,8 +88,8 @@ def _gptq_block(
             else:
                 dequant = q_col * row_scales.squeeze(1)
             err = (col - dequant) / H_inv[j_local, j_local]
-            err = err.clamp(-100.0, 100.0)  # prevent numerical explosion
-            err = torch.nan_to_num(err, nan=0.0, posinf=100.0, neginf=-100.0)
+            err = err.clamp(-ERR_CLAMP_RANGE, ERR_CLAMP_RANGE)  # prevent numerical explosion
+            err = torch.nan_to_num(err, nan=0.0, posinf=ERR_CLAMP_RANGE, neginf=-ERR_CLAMP_RANGE)
             E_block[:, j_offset] = err
 
             # Eager intra-block update: propagate error to remaining columns
@@ -132,15 +134,24 @@ def _ldlq_round_column(
         q_j: [M] quantized values (float, not yet cast to int8)
         err_j_norm: [M] error / scale (ready for Hessian propagation)
     """
-    scale_safe = scale_col.clamp(min=1e-8)
+    scale_safe = scale_col.clamp(min=SCALE_FLOOR)
     y = col / scale_safe
     q = _round_half_away_from_zero(y)
     q = q.clamp(float(clamp_min), float(clamp_max))
 
     # Sign-flip correction: if the weight and quantized value have different
     # signs (and the weight is not near zero), flip the quantized value.
-    # This prevents systematic bias from per-element scale refinement.
-    W_sign = torch.where(col.abs() > 1e-8, col.sign(), q.sign())
+    #
+    # Why this is needed: iterative scale refinement (the outer loop in
+    # ldlq.py → _run_iterative_ldlq) adjusts scales per-column.  For
+    # near-zero weights the refined scale can become small enough that
+    # round(W/s) lands on the *opposite* side of zero from W — i.e.
+    # round(+0.04 / 0.03) → +1 but after a scale tweak round(+0.04 /
+    # 0.05) → 0, then round(+0.04 / 0.02) → +2, etc.  When the sign
+    # does flip, the subsequent Hessian-weighted error propagation
+    # amplifies the bias.  Clamping the quantized value to match the
+    # original weight sign eliminates this drift.
+    W_sign = torch.where(col.abs() > SIGN_FLIP_THRESHOLD, col.sign(), q.sign())
     should_flip = (W_sign * q.sign()) < 0
     # Prevent -8 -> +8 overflow: nudge stuck -8 values to +7
     can_flip = should_flip & (q > float(clamp_min))

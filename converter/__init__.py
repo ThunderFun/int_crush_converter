@@ -11,12 +11,12 @@ from .scales import (
     quantize_weights_asymmetric,
     calculate_scales_int8_asymmetric,
     quantize_weights_int8_asymmetric,
-    INT4_SCALE_DIVISOR,
-    INT8_SCALE_DIVISOR,
 )
+from .config import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
 from .gptq import gptq_quantize_layer, gptq_quantize_layer_rtn
 from .ldlq import ldlq_quantize_layer
 from .calibration_io import load_calibration, build_name_map, get_hessian
+from .types import QuantizationResult, QuantizeConfig, ProgressInfo, ProgressSummary, ProgressCallback
 
 __all__ = [
     "rotate_weights",
@@ -40,6 +40,11 @@ __all__ = [
     "gptq_quantize_layer",
     "gptq_quantize_layer_rtn",
     "ldlq_quantize_layer",
+    "QuantizationResult",
+    "QuantizeConfig",
+    "ProgressInfo",
+    "ProgressSummary",
+    "ProgressCallback",
     "load_calibration",
     "build_name_map",
     "get_hessian",

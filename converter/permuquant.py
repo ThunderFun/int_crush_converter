@@ -11,7 +11,7 @@ so it introduces zero runtime overhead.
 
 import torch
 import torch.nn.functional as F
-from .scales import calculate_scales, quantize_weights, calculate_scales_int8, quantize_weights_int8, INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
+from .scales import calculate_scales, quantize_weights, calculate_scales_int8, quantize_weights_int8
 
 
 def channel_second_moments(W: torch.Tensor) -> torch.Tensor:

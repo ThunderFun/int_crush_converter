@@ -9,9 +9,8 @@ quantization by placing similar channels adjacent to each other.
 
 import torch
 
-INT4_SCALE_DIVISOR = 7.0
-INT8_SCALE_DIVISOR = 127.0
-MAX_FP16_SCALE = 65000.0
+from .config import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, MAX_FP16_SCALE, FP16_SCALE_FLOOR
+from .rounding import _round_half_away_from_zero
 
 
 def _pad_to_group_size(W: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -21,6 +20,43 @@ def _pad_to_group_size(W: torch.Tensor, group_size: int) -> torch.Tensor:
         pad = group_size - (in_features % group_size)
         W = torch.nn.functional.pad(W, (0, pad))
     return W
+
+
+def _search_clipping_ratio(
+    clipping_ratios: list[float],
+    compute_fn,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Search clipping ratios for the lowest-MSE scales (and optional zero-points).
+
+    Iterates over each candidate ratio, calls ``compute_fn(ratio)`` to obtain
+    ``(candidate_scales, candidate_zp, mse)``, and keeps the per-group/row
+    best scales based on MSE.  ``candidate_zp`` is ``None`` for symmetric
+    quantization.
+
+    Args:
+        clipping_ratios: list of ratios to try, e.g. [0.8, 0.85, 0.9, 0.95, 1.0]
+        compute_fn: callable(ratio) -> (candidate_scales, candidate_zp | None, mse)
+
+    Returns:
+        (best_scales, best_zp): best scales and zero-points.
+        ``best_zp`` is ``None`` when ``compute_fn`` always returns ``None`` for zp.
+    """
+    best_scales = None
+    best_zp = None
+    best_mse = None
+    for ratio in clipping_ratios:
+        candidate_scales, candidate_zp, mse = compute_fn(ratio)
+        if best_scales is None:
+            best_scales = candidate_scales
+            best_zp = candidate_zp
+            best_mse = mse
+        else:
+            better = mse < best_mse
+            best_scales = torch.where(better, candidate_scales, best_scales)
+            if candidate_zp is not None:
+                best_zp = torch.where(better, candidate_zp, best_zp)
+            best_mse = torch.where(better, mse, best_mse)
+    return best_scales, best_zp
 
 
 def calculate_scales(W: torch.Tensor, group_size: int = 128,
@@ -46,24 +82,17 @@ def calculate_scales(W: torch.Tensor, group_size: int = 128,
     max_vals = W_grouped.abs().amax(dim=2)
 
     if clipping_ratios is None:
-        scales = (max_vals.float() / INT4_SCALE_DIVISOR).clamp(min=1e-6, max=MAX_FP16_SCALE).to(torch.float16)
+        scales = (max_vals.float() / INT4_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
         return scales
 
-    # Clipping ratio search: try each ratio, compute MSE per group, pick best
-    best_scales = None
-    best_mse = None
-    for ratio in clipping_ratios:
-        candidate_scales = (max_vals.float() * ratio / INT4_SCALE_DIVISOR).clamp(min=1e-6, max=MAX_FP16_SCALE)
+    def _compute(ratio):
+        candidate_scales = (max_vals.float() * ratio / INT4_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
         q = (W_grouped / candidate_scales.unsqueeze(2)).round().clamp(-8, 7)
         dequant = q * candidate_scales.unsqueeze(2)
         mse = (W_grouped - dequant).pow(2).mean(dim=2)
-        if best_scales is None:
-            best_scales = candidate_scales
-            best_mse = mse
-        else:
-            better = mse < best_mse
-            best_scales = torch.where(better, candidate_scales, best_scales)
-            best_mse = torch.where(better, mse, best_mse)
+        return candidate_scales, None, mse
+
+    best_scales, _ = _search_clipping_ratio(clipping_ratios, _compute)
     return best_scales.to(torch.float16)
 
 
@@ -109,25 +138,19 @@ def calculate_scales_int8(W: torch.Tensor,
     max_vals = W.abs().amax(dim=1, keepdim=True)
 
     if clipping_ratios is None:
-        scales = (max_vals.float() / INT8_SCALE_DIVISOR).clamp(min=1e-6, max=MAX_FP16_SCALE).to(torch.float16)
+        scales = (max_vals.float() / INT8_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
         return scales
 
-    # Clipping ratio search
-    best_scales = None
-    best_mse = None
     W_3d = W.unsqueeze(1)  # [out, 1, in]
-    for ratio in clipping_ratios:
-        candidate_scales = (max_vals.float() * ratio / INT8_SCALE_DIVISOR).clamp(min=1e-6, max=MAX_FP16_SCALE)
+
+    def _compute(ratio):
+        candidate_scales = (max_vals.float() * ratio / INT8_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
         q = (W_3d / candidate_scales.unsqueeze(2)).round().clamp(-128, 127)
         dequant = q * candidate_scales.unsqueeze(2)
         mse = (W_3d - dequant).pow(2).mean(dim=2)
-        if best_scales is None:
-            best_scales = candidate_scales
-            best_mse = mse
-        else:
-            better = mse < best_mse
-            best_scales = torch.where(better, candidate_scales, best_scales)
-            best_mse = torch.where(better, mse, best_mse)
+        return candidate_scales, None, mse
+
+    best_scales, _ = _search_clipping_ratio(clipping_ratios, _compute)
     return best_scales.to(torch.float16)
 
 
@@ -179,34 +202,24 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
     w_max = W_grouped.amax(dim=2)
 
     if clipping_ratios is None:
-        scales = ((w_max - w_min).float() / 15.0).clamp(min=1e-6, max=MAX_FP16_SCALE)
-        zero_points = (-8 - torch.round(w_min / scales)).clamp(-8, 7)
+        scales = ((w_max - w_min).float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        zero_points = (-8 - _round_half_away_from_zero(w_min / scales)).clamp(-8, 7)
         # Zero groups: set zp to 0 so zero maps to zero
         zero_groups = (w_min == 0) & (w_max == 0)
         zero_points = zero_points.masked_fill(zero_groups, 0)
         return scales.to(torch.float16), zero_points.to(torch.int8)
 
-    # Clipping ratio search for asymmetric
-    best_scales = None
-    best_zp = None
-    best_mse = None
-    for ratio in clipping_ratios:
+    def _compute(ratio):
         range_vals = (w_max - w_min).float() * ratio
-        candidate_scales = (range_vals / 15.0).clamp(min=1e-6, max=MAX_FP16_SCALE)
-        candidate_zp = (-8 - torch.round(w_min / candidate_scales)).clamp(-8, 7)
+        candidate_scales = (range_vals / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        candidate_zp = (-8 - _round_half_away_from_zero(w_min / candidate_scales)).clamp(-8, 7)
         q = (W_grouped / candidate_scales.unsqueeze(2)
              + candidate_zp.unsqueeze(2)).round().clamp(-8, 7)
         dequant = (q - candidate_zp.unsqueeze(2)) * candidate_scales.unsqueeze(2)
         mse = (W_grouped - dequant).pow(2).mean(dim=2)
-        if best_scales is None:
-            best_scales = candidate_scales
-            best_zp = candidate_zp
-            best_mse = mse
-        else:
-            better = mse < best_mse
-            best_scales = torch.where(better, candidate_scales, best_scales)
-            best_zp = torch.where(better, candidate_zp, best_zp)
-            best_mse = torch.where(better, mse, best_mse)
+        return candidate_scales, candidate_zp, mse
+
+    best_scales, best_zp = _search_clipping_ratio(clipping_ratios, _compute)
     return best_scales.to(torch.float16), best_zp.to(torch.int8)
 
 
@@ -264,32 +277,23 @@ def calculate_scales_int8_asymmetric(
     w_max = W.amax(dim=1, keepdim=True)
 
     if clipping_ratios is None:
-        scales = ((w_max - w_min).float() / 255.0).clamp(min=1e-6, max=MAX_FP16_SCALE)
-        zero_points = (-128 - torch.round(w_min / scales)).clamp(-128, 127)
+        scales = ((w_max - w_min).float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        zero_points = (-128 - _round_half_away_from_zero(w_min / scales)).clamp(-128, 127)
         return scales.to(torch.float16), zero_points.to(torch.int16)
 
-    # Clipping ratio search
-    best_scales = None
-    best_zp = None
-    best_mse = None
     W_3d = W.unsqueeze(1)  # [out, 1, in]
-    for ratio in clipping_ratios:
+
+    def _compute(ratio):
         range_vals = (w_max - w_min).float() * ratio
-        candidate_scales = (range_vals / 255.0).clamp(min=1e-6, max=MAX_FP16_SCALE)
-        candidate_zp = (-128 - torch.round(w_min / candidate_scales)).clamp(-128, 127)
+        candidate_scales = (range_vals / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        candidate_zp = (-128 - _round_half_away_from_zero(w_min / candidate_scales)).clamp(-128, 127)
         q = (W_3d / candidate_scales.unsqueeze(2)
              + candidate_zp.unsqueeze(2)).round().clamp(-128, 127)
         dequant = (q - candidate_zp.unsqueeze(2)) * candidate_scales.unsqueeze(2)
         mse = (W_3d - dequant).pow(2).mean(dim=2)
-        if best_scales is None:
-            best_scales = candidate_scales
-            best_zp = candidate_zp
-            best_mse = mse
-        else:
-            better = mse < best_mse
-            best_scales = torch.where(better, candidate_scales, best_scales)
-            best_zp = torch.where(better, candidate_zp, best_zp)
-            best_mse = torch.where(better, mse, best_mse)
+        return candidate_scales, candidate_zp, mse
+
+    best_scales, best_zp = _search_clipping_ratio(clipping_ratios, _compute)
     return best_scales.to(torch.float16), best_zp.to(torch.int16)
 
 

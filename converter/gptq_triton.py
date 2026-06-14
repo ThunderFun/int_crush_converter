@@ -8,15 +8,14 @@ zero-point vector.
 
 import torch
 
-try:
+from .config import _HAS_TRITON, TRITON_BLOCK_ROWS_GPTQ
+
+# Backward-compatible alias used by gptq.py.
+_HAS_GPTQ_TRITON = _HAS_TRITON
+
+if _HAS_TRITON:
     import triton
     import triton.language as tl
-    _HAS_GPTQ_TRITON = True
-except ImportError:
-    _HAS_GPTQ_TRITON = False
-
-
-if _HAS_GPTQ_TRITON:
 
     @triton.jit
     def _gptq_block_kernel(
@@ -148,7 +147,7 @@ def gptq_loop_triton(
     else:
         zp_gpu = None
 
-    BLOCK_ROWS = 64
+    BLOCK_ROWS = TRITON_BLOCK_ROWS_GPTQ
 
     # When HAS_ZP is False the kernel never reads zp_ptr, but passing
     # the same tensor for both scale_ptr and zp_ptr can cause

@@ -1,6 +1,8 @@
-"""Tests for quant.cli — CLI utilities and quantization pipeline."""
+"""Tests for the should_skip layer filtering logic."""
 
-from converter.cli import should_skip, DEFAULT_SKIP_PATTERNS
+import pytest
+
+from converter.pipeline import should_skip, DEFAULT_SKIP_PATTERNS
 
 
 class TestShouldSkip:

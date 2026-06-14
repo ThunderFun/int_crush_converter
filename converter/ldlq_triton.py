@@ -1,21 +1,26 @@
 """Triton-accelerated LDLQ block kernel.
 
-Processes one full block of columns in a single kernel launch, keeping
-Hinv_block in shared memory for the entire block. Supports INT4 and INT8
-via constexpr parameters.
+Processes one full block of columns in a single kernel launch, fusing the
+per-column quantize + sign-flip + error-propagate loop.
+
+Greedy local search kernels have been moved to :mod:`converter.greedy`.
 """
 
 import torch
 
-try:
-    import triton
-    import triton.language as tl
-    _HAS_TRITON = True
-except ImportError:
-    _HAS_TRITON = False
+from .log import logger
+from .config import _HAS_TRITON, TRITON_BLOCK_ROWS_LDLQ
 
+# Re-export greedy functions for backward compatibility.
+# New code should import from converter.greedy directly.
+from .greedy import (
+    greedy_local_search_triton,
+    greedy_lowrank_triton,
+)
 
 if _HAS_TRITON:
+    import triton
+    import triton.language as tl
 
     @triton.jit
     def _ldlq_block_kernel(
@@ -116,7 +121,7 @@ def ldlq_loop_triton(
     if not scale_2d.is_contiguous():
         scale_2d = scale_2d.contiguous()
 
-    BLOCK_ROWS = 64
+    BLOCK_ROWS = TRITON_BLOCK_ROWS_LDLQ
 
     for i1 in range(0, N, block_size):
         i2 = min(i1 + block_size, N)

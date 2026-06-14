@@ -33,17 +33,22 @@ python -m converter.cli -i model.safetensors -o ./out --rot-size 256 --int-bits 
 | `-o, --output` | required | Output directory |
 | `--rot-size` | `0` | Hadamard group size: `0`/`16`/`64`/`256` |
 | `--int-bits` | `4` | `4` or `8` |
-| `--group-size` | `128` | Channels per scale group (INT4 only; INT8 uses one scale per row) |
+| `--perm-group-size` | `128` | PermuQuant acceptance evaluation group size |
+| `--quant-group-size` | `128` | RTN quantization group size. INT4 always uses per-row scales |
 | `--quant-method` | `rtn` | `rtn` / `gptq` / `ldlq` |
 | `-c, --calibration` | — | `.pt` file from ComfyUI-GPTQ-Calibration |
 | `--gptq-block-size` | `128` | GPTQ/LDLQ block size |
 | `--damping` | `0.01` | GPTQ/LDLQ damping |
 | `--ldlq-iterations` | `1` | LDLQ passes |
+| `--greedy-passes` | `0` | Greedy local search passes after LDLQ (recommended: 5-10) |
+| `--rank-threshold` | `0.01` | Eigenvalue threshold for low-rank greedy. Lower = more eigenvalues kept (better quality, slower) |
 | `--permuquant` | off | Channel reordering |
 | `--tau` | `0.0` | PermuQuant threshold |
 | `--exclude-patterns` | — | Extra layers to skip (appended to defaults) |
 | `--skip-patterns` | defaults | Replace default skip list entirely |
 | `--comfy-compat` | off | ComfyUI-INT8-Fast metadata, INT8 only |
+| `--asymmetric` | off | Asymmetric quantization (scale + zero-point). Better for skewed distributions |
+| `--clipping-ratios` | — | Comma-separated clipping ratios to search, e.g. `0.8,0.85,0.9,0.95,1.0`. Clips outliers for finer grid resolution |
 
 **Default skip patterns:** `embed`, `norm`, `modulation`, `lm_head`, `output`, `proj_out`
 
@@ -90,7 +95,7 @@ Contains:
 
 - Only 2D weight tensors are quantized.
 - `rot_size` must be power of 4 or `0`.
-- `group_size` must be power of 2 ≥ 32. INT4 only; INT8 always uses one scale per row.
+- `perm-group-size` and `quant-group-size` must be power of 2 ≥ 32. INT4 only; INT8 always uses one scale per row.
 - GPTQ falls back to RTN for layers without calibration data.
 
 

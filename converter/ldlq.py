@@ -9,16 +9,24 @@ per-element scales with sign-flip correction and round-half-away-from-zero.
 """
 
 import math
-import warnings
 
 import torch
 
-from .scales import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
-from .rounding import _invert_hessian, _round_half_away_from_zero, _ldlq_round_column
-from .ldlq_triton import ldlq_loop_triton, _HAS_TRITON
+from .log import logger
+from .config import (
+    ABS_SCALE_FLOOR, CONVERGENCE_EPS, CONVERGENCE_IMPROVEMENT_THRESHOLD,
+    DENOMINATOR_FLOOR, DIAG_MEAN_FLOOR, HINV_DIAG_FLOOR, SCALE_CEIL_MULTIPLIER,
+    SCALE_FLOOR, FP16_SCALE_FLOOR, SCALE_FLOOR_MULTIPLIER, SANITIZE_CEIL, SANITIZE_FLOOR,
+    INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, MAX_FP16_SCALE,
+)
+from .rounding import _invert_hessian, _ldlq_round_column
+from .types import QuantizationResult
+from .greedy import greedy_local_search_pytorch, greedy_lowrank_triton, greedy_local_search_triton, _HAS_TRITON
+from .ldlq_triton import ldlq_loop_triton
 
 
 _ldlq_compiled_fn = None
+# torch.compile requires PyTorch 2.0+; guard for older versions.
 _HAS_TORCH_COMPILE = hasattr(torch, "compile")
 
 
@@ -51,7 +59,7 @@ def _get_ldlq_compiled_fn():
             err_norm = err / hinv_diag_val
             return q.to(torch.int8), err_norm
         _ldlq_compiled_fn = _compiled_ldlq_column
-    except Exception:
+    except (RuntimeError, ImportError):
         _ldlq_compiled_fn = None
     return _ldlq_compiled_fn
 
@@ -62,7 +70,9 @@ def ldlq_quantize_layer(
     damping: float = 0.01,
     int_bits: int = 4,
     iterations: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    greedy_passes: int = 0,
+    rank_threshold: float = 0.01,
+) -> QuantizationResult:
     """Quantize a weight matrix using LDLQ (weight-only, no calibration).
 
     Computes H = W^T @ W / M as the Hessian, then runs the GPTQ column loop
@@ -74,11 +84,13 @@ def ldlq_quantize_layer(
         damping: damping ratio as fraction of mean diagonal (default: 0.01)
         int_bits: quantization bit-width (4 or 8)
         iterations: number of LDLQ iterations with scale refinement (1 = single pass)
+        greedy_passes: greedy coordinate descent passes after LDLQ (0 = disabled)
+        rank_threshold: eigenvalue threshold for low-rank greedy (default: 0.01).
+            Lower values keep more eigenvalues (better quality, slower).
+            Only used when greedy_passes > 0 and Triton is available.
 
     Returns:
-        (quantized_W, scales):
-            quantized_W: [out_features, in_features] quantized values as int8
-            scales: [out_features, 1] float16 per-row scales
+        QuantizationResult with quantized_W, scales, method_used, and fallbacks populated.
     """
     if int_bits not in (4, 8):
         raise ValueError(f"int_bits must be 4 or 8, got {int_bits}")
@@ -92,28 +104,80 @@ def ldlq_quantize_layer(
     clamp_min = -128 if int_bits == 8 else -8
     clamp_max = 127 if int_bits == 8 else 7
 
+    fallbacks: list[str] = []
+
     # Compute Hessian from weights: H = W^T @ W / M
     H = W.T @ W / M
-    diag_mean = H.diagonal().mean().clamp(min=1e-6)
+
+    # Guard: if H has inf/nan (from extreme weight values), fall back to RTN
+    if not torch.isfinite(H).all():
+        logger.warning("LDLQ: Hessian has inf/nan (weight abs_max=%.2e), falling back to RTN", W.abs().max().item())
+        row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        q = (W / row_scales).round().clamp(clamp_min, clamp_max).to(torch.int8)
+        dequant = q.float() * row_scales.float()
+        mse = (W - dequant).pow(2).mean().item()
+        max_err = (W - dequant).abs().max().item()
+        fallbacks.append("hessian_nan_rtn")
+        return QuantizationResult(
+            quantized_W=q,
+            scales=row_scales.to(torch.float16),
+            zero_points=None,
+            mse=mse,
+            max_err=max_err,
+            method_used="rtn",
+            fallbacks=fallbacks,
+        )
+
+    diag_mean = H.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
     H = H + damping * diag_mean * torch.eye(N, dtype=torch.float32)
     H_inv = _invert_hessian(H)
 
     # Initial per-row scales
-    row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=1e-6)
+    row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=FP16_SCALE_FLOOR)
 
-    # Expand to per-element scales for LDLQ (all elements in a row share
-    # the same scale, so this is equivalent to per-row quantization with
-    # column-by-column error propagation).
+    # Expand per-row scales to per-element for the LDLQ column loop.
     flat_scales = row_scales.expand(M, N).reshape(-1).clone()
 
     if iterations > 1:
-        warnings.warn(
-            "LDLQ scale refinement (iterations > 1) is incompatible with "
-            "per-row scale storage. Using a single pass instead.",
-            stacklevel=2,
+        quantized_W, _ = _run_iterative_ldlq(
+            W, H_inv, flat_scales, iterations, block_size, clamp_min, clamp_max,
+        )
+    else:
+        quantized_W = _single_ldlq_pass(W, H_inv, flat_scales, block_size, clamp_min, clamp_max)
+
+    # Greedy local search: coordinate descent on the quantization grid.
+    if greedy_passes > 0:
+        # Compute per-row least-squares scales for the greedy step
+        Q_float = quantized_W.float()
+        numerator = (Q_float * W).sum(dim=1, keepdim=True)
+        denominator = (Q_float * Q_float).sum(dim=1, keepdim=True).clamp(min=DENOMINATOR_FLOOR)
+        greedy_scales = (numerator / denominator).clamp(min=FP16_SCALE_FLOOR)
+        scale_2d = greedy_scales.expand(M, N)
+
+        # Move to GPU for Triton if available (matching _single_ldlq_pass pattern)
+        greedy_device = torch.device("cuda") if torch.cuda.is_available() else W.device
+        oom_fallback = False
+        try:
+            W_g = W.to(greedy_device)
+            Q_g = quantized_W.to(greedy_device)
+            s_g = scale_2d.to(greedy_device)
+            H_g = H.to(greedy_device)
+        except torch.cuda.OutOfMemoryError:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            greedy_device = W.device
+            W_g, Q_g, s_g, H_g = W, quantized_W, scale_2d, H
+            oom_fallback = True
+            fallbacks.append("greedy_oom_cpu")
+
+        quantized_W = _greedy_local_search(
+            W_g, Q_g, s_g, H_g, greedy_passes, clamp_min, clamp_max,
+            rank_threshold=rank_threshold,
         )
 
-    quantized_W = _single_ldlq_pass(W, H_inv, flat_scales, block_size, clamp_min, clamp_max)
+        # Move back to original device
+        if quantized_W.device != W.device:
+            quantized_W = quantized_W.to(W.device)
 
     # Compute the per-row scale that best fits the quantized integers to the
     # original weights.  For each row i the least-squares optimum is:
@@ -121,9 +185,31 @@ def ldlq_quantize_layer(
     # This keeps Q unchanged while finding the best dequantization scale.
     Q_float = quantized_W.float()
     numerator = (Q_float * W).sum(dim=1, keepdim=True)
-    denominator = (Q_float * Q_float).sum(dim=1, keepdim=True).clamp(min=1e-8)
-    final_scales = (numerator / denominator).clamp(min=1e-6)
-    return quantized_W, final_scales.to(torch.float16)
+    denominator = (Q_float * Q_float).sum(dim=1, keepdim=True).clamp(min=DENOMINATOR_FLOOR)
+    final_scales = (numerator / denominator).clamp(min=FP16_SCALE_FLOOR)
+
+    # Compute MSE and max error for the result
+    dequant = quantized_W.float() * final_scales.float()
+    mse = (W - dequant).pow(2).mean().item()
+    max_err = (W - dequant).abs().max().item()
+
+    # Determine method used (best-effort: based on device and Triton availability)
+    if _HAS_TRITON and W.device.type == "cuda":
+        method_used = "ldlq_triton"
+    elif _HAS_TORCH_COMPILE:
+        method_used = "ldlq_compile"
+    else:
+        method_used = "ldlq_cpu"
+
+    return QuantizationResult(
+        quantized_W=quantized_W,
+        scales=final_scales.to(torch.float16),
+        zero_points=None,
+        mse=mse,
+        max_err=max_err,
+        method_used=method_used,
+        fallbacks=fallbacks,
+    )
 
 
 def _single_ldlq_pass(
@@ -179,32 +265,32 @@ def _single_ldlq_pass(
 
     # Sanitize non-finite scales
     if not torch.isfinite(scale_2d).all():
-        scale_2d = torch.nan_to_num(scale_2d, nan=1e-8, posinf=1e30, neginf=1e-8)
-        scale_2d = scale_2d.clamp(min=1e-8)
+        scale_2d = torch.nan_to_num(scale_2d, nan=SANITIZE_FLOOR, posinf=SANITIZE_CEIL, neginf=SANITIZE_FLOOR)
+        scale_2d = scale_2d.clamp(min=SANITIZE_FLOOR)
 
     # Choose processing strategy: Triton > torch.compile > eager
     if target_device.type == "cpu":
-        print(f"    LDLQ: CPU path, {M}x{N}, block_size={block_size}")
+        logger.debug("LDLQ: CPU path, %dx%d, block_size=%d", M, N, block_size)
         Q_prime = _ldlq_loop_cpu(W_work, H_inv, scale_2d, Q_prime, N, M, block_size, clamp_min, clamp_max)
     else:
         # Try Triton block kernel first (fastest — fuses entire block into one launch)
         if _HAS_TRITON and block_size <= N:
             result = ldlq_loop_triton(W_work, H_inv, scale_2d, Q_prime, N, M, block_size, clamp_min, clamp_max)
             if result is not None:
-                print(f"    LDLQ: GPU path (Triton), {M}x{N}, block_size={block_size}")
+                logger.debug("LDLQ: GPU path (Triton), %dx%d, block_size=%d", M, N, block_size)
                 Q_prime = result
             else:
                 compiled_fn = _get_ldlq_compiled_fn()
                 accel = "torch.compile" if compiled_fn is not None else "eager"
-                print(f"    LDLQ: GPU path ({accel}), {M}x{N}, block_size={block_size}")
+                logger.debug("LDLQ: GPU path (%s), %dx%d, block_size=%d", accel, M, N, block_size)
                 Q_prime = _ldlq_loop_gpu(W_work, H_inv, scale_2d, Q_prime, N, M, block_size, clamp_min, clamp_max,
                                          compiled_fn=compiled_fn)
         else:
             compiled_fn = _get_ldlq_compiled_fn()
             accel = "torch.compile" if compiled_fn is not None else "eager"
-            print(f"    LDLQ: GPU path ({accel}), {M}x{N}, block_size={block_size}")
+            logger.debug("LDLQ: GPU path (%s), %dx%d, block_size=%d", accel, M, N, block_size)
             Q_prime = _ldlq_loop_gpu(W_work, H_inv, scale_2d, Q_prime, N, M, block_size, clamp_min, clamp_max,
-                                     compiled_fn=compiled_fn)
+                                      compiled_fn=compiled_fn)
 
     # Move result back to original device
     if Q_prime.device != original_device:
@@ -232,14 +318,12 @@ def _ldlq_loop_cpu(
     batch update to columns outside the block. This is the standard GPTQ
     algorithm (Frantar et al., 2022) with lazy batch updates.
     """
-    hinv_diag_inv_cache = {}
-
     for i1 in range(0, N, block_size):
         i2 = min(i1 + block_size, N)
         block_count = i2 - i1
 
         Hinv_block = H_inv[i1:i2, i1:i2]
-        hinv_diag = torch.diag(Hinv_block).clamp(min=1e-8)
+        hinv_diag = torch.diag(Hinv_block).clamp(min=HINV_DIAG_FLOOR)
         hinv_diag_inv = (1.0 / hinv_diag).to(torch.float32)
 
         err_accum = torch.zeros(M, block_count, dtype=torch.float32)
@@ -247,22 +331,9 @@ def _ldlq_loop_cpu(
         for j_local in range(block_count):
             j = i1 + j_local
 
-            scale_col = scale_2d[:, j].clamp(min=1e-8)
-            q_j = _round_half_away_from_zero(W_work[:, j] / scale_col)
-            q_j = q_j.clamp(float(clamp_min), float(clamp_max))
-
-            # Sign-flip correction
-            W_sign = torch.where(W_work[:, j].abs() > 1e-8, W_work[:, j].sign(), q_j.sign())
-            should_flip = (W_sign * q_j.sign()) < 0
-            can_flip = should_flip & (q_j > float(clamp_min))
-            q_j = torch.where(should_flip & (q_j == float(clamp_min)),
-                              torch.full_like(q_j, float(clamp_max)), q_j)
-            q_j = torch.where(can_flip, -q_j, q_j)
-            q_j = q_j.clamp(float(clamp_min), float(clamp_max))
-
+            q_j, err_j = _ldlq_round_column(W_work[:, j], scale_2d[:, j], clamp_min, clamp_max)
             Q_prime[:, j] = q_j.to(torch.int8)
 
-            err_j = W_work[:, j] - q_j * scale_col
             err_j_norm = err_j * hinv_diag_inv[j_local]
             err_accum[:, j_local] = err_j_norm
 
@@ -304,7 +375,7 @@ def _ldlq_loop_gpu(
         block_count = i2 - i1
 
         Hinv_block = H_inv[i1:i2, i1:i2]
-        hinv_diag = torch.diag(Hinv_block).clamp(min=1e-8)
+        hinv_diag = torch.diag(Hinv_block).clamp(min=HINV_DIAG_FLOOR)
 
         err_accum = torch.zeros(M, block_count, device=W_work.device, dtype=torch.float32)
 
@@ -319,22 +390,9 @@ def _ldlq_loop_gpu(
                 Q_prime[:, j] = q_int8
                 err_accum[:, j_local] = err_j_norm
             else:
-                scale_col = scale_2d[:, j].clamp(min=1e-8)
-                q_j = _round_half_away_from_zero(W_work[:, j] / scale_col)
-                q_j = q_j.clamp(float(clamp_min), float(clamp_max))
-
-                # Sign-flip correction
-                W_sign = torch.where(W_work[:, j].abs() > 1e-8, W_work[:, j].sign(), q_j.sign())
-                should_flip = (W_sign * q_j.sign()) < 0
-                can_flip = should_flip & (q_j > float(clamp_min))
-                q_j = torch.where(should_flip & (q_j == float(clamp_min)),
-                                  torch.full_like(q_j, float(clamp_max)), q_j)
-                q_j = torch.where(can_flip, -q_j, q_j)
-                q_j = q_j.clamp(float(clamp_min), float(clamp_max))
-
+                q_j, err_j = _ldlq_round_column(W_work[:, j], scale_2d[:, j], clamp_min, clamp_max)
                 Q_prime[:, j] = q_j.to(torch.int8)
 
-                err_j = W_work[:, j] - q_j * scale_col
                 err_j_norm = err_j / hinv_diag[j_local]
                 err_accum[:, j_local] = err_j_norm
 
@@ -376,8 +434,8 @@ def _run_iterative_ldlq(
 
     # Sanitize non-finite scales
     if not torch.isfinite(current_scales).all():
-        current_scales = torch.nan_to_num(current_scales, nan=1e-8, posinf=1e30, neginf=1e-8)
-        current_scales = current_scales.clamp(min=1e-8)
+        current_scales = torch.nan_to_num(current_scales, nan=SANITIZE_FLOOR, posinf=SANITIZE_CEIL, neginf=SANITIZE_FLOOR)
+        current_scales = current_scales.clamp(min=SANITIZE_FLOOR)
 
     SCALE_MOMENTUM = 0.3
     MSE_DIVERGENCE_THRESHOLD = 1.05
@@ -393,23 +451,23 @@ def _run_iterative_ldlq(
         # Compute MSE
         mse = (W - Q_iter.float() * current_scales.reshape(M, N)).abs().pow(2).mean().item()
         mse_values.append(mse)
-        print(f"    LDLQ iteration {iter_idx + 1}/{iterations}: MSE={mse:.6f}")
+        logger.debug("LDLQ iteration %d/%d: MSE=%.6f", iter_idx + 1, iterations, mse)
 
         if not math.isfinite(mse):
-            print(f"    LDLQ: non-finite MSE at iteration {iter_idx + 1}, reverting")
+            logger.warning("LDLQ: non-finite MSE at iteration %d, reverting", iter_idx + 1)
             if prev_scales is not None:
                 current_scales = prev_scales
             break
 
         if iter_idx > 0 and mse > prev_mse * MSE_DIVERGENCE_THRESHOLD:
-            print(f"    LDLQ: diverged at iteration {iter_idx + 1} (MSE increased), reverting")
+            logger.warning("LDLQ: diverged at iteration %d (MSE increased), reverting", iter_idx + 1)
             if prev_scales is not None:
                 current_scales = prev_scales
             break
 
-        improvement = (prev_mse - mse) / (prev_mse + 1e-10)
-        if iter_idx > 0 and improvement < 1e-4:
-            print(f"    LDLQ: converged at iteration {iter_idx + 1} (improvement={improvement:.6f})")
+        improvement = (prev_mse - mse) / (prev_mse + CONVERGENCE_EPS)
+        if iter_idx > 0 and improvement < CONVERGENCE_IMPROVEMENT_THRESHOLD:
+            logger.debug("LDLQ: converged at iteration %d (improvement=%.6f)", iter_idx + 1, improvement)
             break
 
         prev_mse = mse
@@ -420,11 +478,8 @@ def _run_iterative_ldlq(
                 W, Q_iter, current_scales, flat_scales, SCALE_MOMENTUM, W_NONZERO_THRESHOLD
             )
 
-        # Free intermediates between iterations
-        if iter_idx < iterations - 1 and Q_iter is not Q_result:
-            del Q_iter
-            if iter_idx % 2 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # Q_result = Q_iter (same object); intermediates are freed by
+        # overwriting Q_iter on the next iteration.
 
     if len(mse_values) > 1:
         mse_str = " ".join([f"{m:.6f}" for m in mse_values])
@@ -457,8 +512,8 @@ def _update_ldlq_scales(
 
     new_scales = current_scales.clone()
     scale_min, scale_max = flat_scales.aminmax()
-    scale_floor = max(scale_min.item() * 0.1, 1e-8)
-    scale_ceil = scale_max.item() * 10.0
+    scale_floor = max(scale_min.item() * SCALE_FLOOR_MULTIPLIER, ABS_SCALE_FLOOR)
+    scale_ceil = scale_max.item() * SCALE_CEIL_MULTIPLIER
 
     if valid.any():
         try:
@@ -467,15 +522,63 @@ def _update_ldlq_scales(
                 new_scales[valid] = momentum * current_scales[valid] + (1 - momentum) * computed
             else:
                 new_scales[valid] = computed
-        except (RuntimeError, IndexError) as e:
-            # Triton kernel memory corruption can produce garbage indices
-            print(f"    LDLQ: scale update failed ({e}), reverting to original scales")
+        except RuntimeError as e:
+            # Indexing or shape mismatch — revert to original scales
+            logger.warning("LDLQ: scale update failed (%s), reverting to original scales", e)
             new_scales[valid] = flat_scales[valid].clamp(scale_floor, scale_ceil)
 
     if mismatched.any():
         try:
             new_scales[mismatched] = flat_scales[mismatched].clamp(scale_floor, scale_ceil)
-        except RuntimeError:
-            pass
+        except RuntimeError as e:
+            logger.warning("LDLQ: mismatched scale update failed (%s)", e)
 
     return new_scales
+
+
+def _greedy_local_search(
+    W: torch.Tensor,
+    Q: torch.Tensor,
+    scale_2d: torch.Tensor,
+    H: torch.Tensor,
+    num_passes: int,
+    clamp_min: int,
+    clamp_max: int,
+    rank_threshold: float = 0.01,
+) -> torch.Tensor:
+    """Greedy local search with automatic backend selection.
+
+    Delegates to :mod:`converter.greedy` which selects the fastest available
+    backend: low-rank Triton → full-rank Triton v2 → PyTorch.
+
+    Converts Q to float32 contiguous once here so that each backend
+    does not need to clone independently.
+    """
+    # Prepare Q once as float32 contiguous — all backends modify it in-place
+    Q = Q.clone().float().contiguous()
+
+    # Try low-rank Triton first (fastest for low-rank Hessians)
+    if _HAS_TRITON and W.is_cuda:
+        result = greedy_lowrank_triton(
+            W, Q, scale_2d, H, num_passes, clamp_min, clamp_max,
+            rank_threshold=rank_threshold,
+        )
+        if result is not None:
+            Q_out, k, used_lowrank = result
+            if Q_out is not None:
+                path = "lowrank" if used_lowrank else "v2"
+                logger.debug("Greedy: GPU path (Triton %s), k=%d", path, k)
+                return Q_out
+
+    # Fall back to full-rank Triton v2
+    if _HAS_TRITON and W.is_cuda:
+        result = greedy_local_search_triton(
+            W, Q, scale_2d, H, num_passes, clamp_min, clamp_max,
+        )
+        if result is not None:
+            logger.debug("Greedy: GPU path (Triton v2)")
+            return result
+
+    # PyTorch fallback
+    logger.debug("Greedy: CPU path")
+    return greedy_local_search_pytorch(W, Q, scale_2d, H, num_passes, clamp_min, clamp_max)

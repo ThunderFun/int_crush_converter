@@ -6,440 +6,125 @@ Usage:
 """
 
 import argparse
+import logging
 import os
-from pathlib import Path
+import sys
 
-import torch
-from safetensors.torch import load_file, save_file
+from .log import logger
+from .pipeline import quantize_model, DEFAULT_SKIP_PATTERNS
+from .types import ProgressInfo, ProgressSummary, QuantizeConfig
 
-from .rotation import rotate_weights, _is_power_of_two, rotate_hessian
-from .scales import (
-    calculate_scales, quantize_weights,
-    calculate_scales_int8, quantize_weights_int8,
-    calculate_scales_asymmetric, quantize_weights_asymmetric,
-    calculate_scales_int8_asymmetric, quantize_weights_int8_asymmetric,
-)
-from .packing import pack_int4
-from .permuquant import find_permutation_weight, sweep_alpha
-from .calibration_io import load_calibration, build_name_map, get_hessian, get_permutation
-from .gptq import gptq_quantize_layer, gptq_quantize_layer_rtn
-from .ldlq import ldlq_quantize_layer
+# ANSI escape codes.
+# Progress output goes to stderr so stdout stays clean for piped output.
+# Auto-disabled when stderr is not a TTY (piped output, CI logs, etc.).
+_USE_COLOR = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
 
+_RESET  = "\033[0m"
+_DIM    = "\033[2m"
+_BOLD   = "\033[1m"
+# 24-bit colors for text.
+_GREEN  = "\033[38;2;120;230;120m"
+_YELLOW = "\033[38;2;240;220;90m"
+_RED    = "\033[38;2;200;80;80m"
+_BLUE   = "\033[38;2;100;160;230m"
+_CYAN   = "\033[38;2;80;190;200m"
 
-DEFAULT_SKIP_PATTERNS = [
-    "embed",
-    "norm",
-    "modulation",
-    "lm_head",
-    "output",
-    "proj_out",
+# Anchor points for the progress gradient (percentage → RGB).
+# Smoothly interpolated via 24-bit true color.
+_GRADIENT_ANCHORS = [
+    (0,   (200, 80,  80)),    # red
+    (50,  (220, 200, 70)),    # yellow
+    (100, (100, 200, 100)),   # green
 ]
 
 
-def should_skip(name: str, skip_patterns: list[str]) -> bool:
-    """Return True if a layer name matches any skip pattern (case-insensitive).
+def _c(text: str, color: str) -> str:
+    """Wrap *text* in an ANSI color, or return it plain if colors are off."""
+    if not _USE_COLOR:
+        return text
+    return f"{color}{text}{_RESET}"
 
-    Skipped layers (embeddings, norms, output projections, etc.) are stored
-    in the output safetensors without quantization.
+
+def _pct_color(pct: float) -> str:
+    """Pick a smooth 24-bit color from red (0%) to green (100%)."""
+    pct = max(0.0, min(100.0, pct))
+    # Find the two anchors we're between
+    for i in range(len(_GRADIENT_ANCHORS) - 1):
+        p0, c0 = _GRADIENT_ANCHORS[i]
+        p1, c1 = _GRADIENT_ANCHORS[i + 1]
+        if pct <= p1:
+            t = (pct - p0) / (p1 - p0)
+            r = int(c0[0] + (c1[0] - c0[0]) * t)
+            g = int(c0[1] + (c1[1] - c0[1]) * t)
+            b = int(c0[2] + (c1[2] - c0[2]) * t)
+            return f"\033[38;2;{r};{g};{b}m"
+    return _GREEN
+
+
+def _configure_cli_logging(level: int) -> None:
+    """Attach a StreamHandler to the package logger for CLI use.
+
+    This deliberately avoids ``logging.basicConfig`` so that importing
+    ``converter`` as a library never mutates the root logger or clobbers
+    the host application's logging configuration.
     """
-    name_lower = name.lower()
-    return any(pattern in name_lower for pattern in skip_patterns)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level)
 
 
-def quantize_model(
-    input_path: str,
-    output_dir: str,
-    rot_size: int = 256,
-    group_size: int = 128,
-    use_permuquant: bool = False,
-    tau: float = 0.0,
-    skip_patterns: list[str] | None = None,
-    exclude_patterns: list[str] | None = None,
-    calibration_path: str | None = None,
-    quant_method: str = "rtn",
-    gptq_block_size: int = 128,
-    damping: float = 0.01,
-    int_bits: int = 4,
-    ldlq_iterations: int = 1,
-    comfy_compat: bool = False,
-    asymmetric: bool = False,
-    clipping_ratios: list[float] | None = None,
-) -> None:
-    """Quantize a model from safetensors using INT-Crush + PermuQuant + GPTQ/LDLQ.
+class _PerLayerFilter(logging.Filter):
+    """Suppress the per-layer 'Quantizing ...' log line.
 
-    Args:
-        input_path: Path to input safetensors file
-        output_dir: Output directory for quantized model
-        rot_size: Regular Hadamard group size (power of 4: 16/64/256)
-        group_size: Quantization group size (default: 128)
-        use_permuquant: Whether to apply PermuQuant channel reordering
-        tau: PermuQuant acceptance threshold (default: 0.0)
-        skip_patterns: Custom skip patterns (default: common patterns)
-        calibration_path: Path to .pt calibration file (required for GPTQ)
-        quant_method: Quantization method: "rtn", "gptq", or "ldlq"
-        gptq_block_size: GPTQ/LDLQ block size (default: 128)
-        damping: GPTQ/LDLQ damping ratio (default: 0.01)
-        int_bits: quantization bit-width (4 or 8)
-        ldlq_iterations: Number of LDLQ iterations with scale refinement (default: 1)
-        asymmetric: Use asymmetric quantization (scale + zero-point)
-        clipping_ratios: List of clipping ratios to search for lowest MSE
+    When progress callback is active, the callback prints its own
+    per-layer line with percentage and ETA.  The bare 'Quantizing ...'
+    log message would be redundant, so this filter drops it while
+    keeping all other INFO messages (loading, saving, summary).
     """
-    if skip_patterns is None:
-        skip_patterns = DEFAULT_SKIP_PATTERNS
 
-    if exclude_patterns:
-        skip_patterns = list(skip_patterns) + exclude_patterns
-        print(f"Excluding additional patterns: {exclude_patterns}")
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (record.levelno == logging.INFO
+                    and record.getMessage().startswith("Quantizing "))
 
-    if quant_method not in ("rtn", "gptq", "ldlq"):
-        raise ValueError(f"quant_method must be 'rtn', 'gptq', or 'ldlq', got '{quant_method}'")
 
-    if quant_method == "gptq" and not calibration_path:
-        raise ValueError("GPTQ requires --calibration path to a .pt file")
-
-    if quant_method == "ldlq" and calibration_path:
-        import warnings
-        warnings.warn("LDLQ does not use calibration data; --calibration path will be ignored")
-
-    if rot_size > 0 and not _is_power_of_two(rot_size):
-        raise ValueError(f"rot_size must be 0 (no rotation) or a power of 2, got {rot_size}")
-
-    if group_size < 32 or (group_size & (group_size - 1)) != 0:
-        raise ValueError(f"group_size must be a power of 2 >= 32, got {group_size}")
-
-    if int_bits not in (4, 8):
-        raise ValueError(f"int_bits must be 4 or 8, got {int_bits}")
-
-    is_int8 = int_bits == 8
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    print(f"Loading {input_path}...")
-    state_dict = load_file(input_path)
-    print(f"Loaded {len(state_dict)} tensors")
-
-    # Load calibration data if GPTQ
-    calibration = None
-    name_map = {}
-    if quant_method == "gptq":
-        print(f"Loading calibration from {calibration_path}...")
-        calibration = load_calibration(calibration_path)
-        cal_keys = list(calibration["hessians"].keys())
-        name_map = build_name_map(list(state_dict.keys()), cal_keys)
-        print(f"Matched {len(name_map)}/{len(cal_keys)} calibration layers to model layers")
-
-    output_dict = {}
-    meta_prefix = "int_crush"
-    method_base = "int_crush_permuq" if use_permuquant else "int_crush"
-    method = f"{method_base}_{quant_method}" if quant_method in ("gptq", "ldlq") else method_base
-    metadata = {
-        f"{meta_prefix}.format_version": "3" if not is_int8 else "1",
-        f"{meta_prefix}.method": method,
-        f"{meta_prefix}.rot_size": str(rot_size),
-        f"{meta_prefix}.scale_type": "per_row_asymmetric" if asymmetric else "per_row",
-        f"{meta_prefix}.hadamard_type": "regular",
-    }
-    if not is_int8:
-        metadata["int_crush.packing_order"] = "little"
-    else:
-        metadata["int_crush.packing_order"] = "native"
-    if exclude_patterns:
-        metadata[f"{meta_prefix}.exclude_patterns"] = ",".join(exclude_patterns)
-
-    # Detect layers whose in_features will be padded by rotation.
-    # ComfyUI reads in_channels from img_in.weight.shape[1], so padded
-    # weights cause wrong model configuration. Store originals so the
-    # loader can fix the model after creation.
-    padded_layers = {}
-    if rot_size > 0:
-        for name, tensor in state_dict.items():
-            if tensor.dim() == 2 and not should_skip(name, skip_patterns):
-                orig_in = tensor.shape[1]
-                if orig_in % rot_size != 0:
-                    padded_in = rot_size * ((orig_in + rot_size - 1) // rot_size)
-                    padded_layers[name] = str(orig_in)
-                    print(f"  Tracking padded layer: {name} in_features {orig_in} -> {padded_in}")
-        if padded_layers:
-            metadata["int_crush.padded_layers"] = ";".join(
-                f"{k}={v}" for k, v in padded_layers.items()
-            )
-    if use_permuquant:
-        metadata["int_crush.permuquant"] = "true"
-        metadata["int_crush.permuquant_tau"] = str(tau)
-    if quant_method == "gptq":
-        metadata[f"{meta_prefix}.gptq_block_size"] = str(gptq_block_size)
-        metadata[f"{meta_prefix}.damping_ratio"] = str(damping)
-    elif quant_method == "ldlq":
-        metadata[f"{meta_prefix}.ldlq_block_size"] = str(gptq_block_size)
-        metadata[f"{meta_prefix}.damping_ratio"] = str(damping)
-
-    skipped = 0
-    quantized = 0
-    permuted = 0
-    gptq_count = 0
-    rtn_fallback = 0
-
-    for name, tensor in state_dict.items():
-        # Skip non-quantizable layers
-        if should_skip(name, skip_patterns):
-            output_dict[name] = tensor
-            skipped += 1
-            continue
-
-        # Only quantize 2D weight tensors
-        if tensor.dim() != 2:
-            output_dict[name] = tensor
-            skipped += 1
-            continue
-
-        print(f"Quantizing {name} ({tensor.shape})...")
-
-        W = tensor.float()
-        orig_in_features = W.shape[1]
-
-        # 1. Rotate weights (skip if rot_size == 0)
-        if rot_size > 0:
-            W_work = rotate_weights(W, rot_size)
+def _cli_progress_callback(info: ProgressInfo | ProgressSummary) -> None:
+    """Print per-layer progress and summary to stderr."""
+    if isinstance(info, ProgressInfo):
+        pct = info.current_layer / info.total_layers * 100
+        eta = info.estimated_remaining_seconds
+        if eta >= 60:
+            eta_str = f"{int(eta // 60)}m{int(eta % 60):02d}s"
         else:
-            W_work = W.clone()
+            eta_str = f"{eta:.0f}s"
 
-        # 2. PermuQuant: apply channel reordering
-        #    If calibration provides a permutation (from ComfyUI-GPTQ-Calibration),
-        #    use it directly — the Hessians are already in permuted space.
-        #    Otherwise, compute our own from weight statistics.
-        perm_applied = False
-        perm_orig = None
-        cal_perm = None
-        if use_permuquant:
-            layer_name = name_map.get(name) if name_map else None
-            if layer_name is not None and calibration is not None:
-                cal_perm = get_permutation(calibration, layer_name)
-
-            if cal_perm is not None:
-                # Apply calibration permutation to weight only (Hessian already permuted).
-                orig_features = min(orig_in_features, cal_perm.shape[0])
-                perm_slice = cal_perm[:orig_features]
-                if (perm_slice.max() < orig_features
-                        and perm_slice.min() >= 0
-                        and perm_slice.unique().numel() == perm_slice.numel()):
-                    W_orig = W_work[:, :orig_features]
-                    W_work[:, :orig_features] = W_orig[:, perm_slice]
-                    perm_orig = perm_slice
-                    perm_applied = True
-                    permuted += 1
-                    print(f"  PermuQuant applied (from calibration)")
-                else:
-                    print(f"  WARNING: calibration permutation out of bounds, falling back to weight-only")
-
-            if not perm_applied:
-                W_orig = W_work[:, :orig_in_features]
-                # For INT4, all methods (RTN, GPTQ, LDLQ) use per-row
-                # quantization.  PermuQuant's acceptance check must use the
-                # same granularity or it evaluates a different scheme.
-                actual_group_size = W_orig.shape[1] if int_bits == 4 else group_size
-                perm, alpha, accepted = sweep_alpha(
-                    W_orig, act_mu2=None, group_size=actual_group_size, tau=tau, int_bits=int_bits
-                )
-                if accepted:
-                    W_work[:, :orig_in_features] = W_orig[:, perm]
-                    perm_orig = perm
-                    perm_applied = True
-                    permuted += 1
-                    print(f"  PermuQuant applied (alpha={alpha:.2f})")
-                else:
-                    print(f"  PermuQuant skipped (no improvement)")
-
-        zero_points = None
-
-        # 3. Quantize
-        if quant_method == "gptq":
-            # GPTQ: use Hessian-based error compensation
-            layer_name = name_map.get(name)
-            hessian = None
-            if layer_name is not None:
-                hessian = get_hessian(calibration, layer_name, tensor.shape)
-
-            if hessian is not None:
-                already_rotated = calibration.get("metadata", {}).get("hessian_rotated", False)
-                cal_rot_size = calibration.get("metadata", {}).get("rot_size", 0)
-
-                # If the calibration was rotated with a different rot_size
-                # than the converter is using, the Hessian is in the wrong
-                # space.  We can't re-rotate from the original space, but
-                # we should warn the user.
-                if already_rotated and cal_rot_size and int(cal_rot_size) != rot_size:
-                    print(f"  WARNING: calibration rot_size={cal_rot_size} != converter rot_size={rot_size}. "
-                          f"Hessian is in the wrong rotation space. "
-                          f"Re-run calibration with rot_size={rot_size} for best results.")
-
-                if not already_rotated:
-                    if cal_perm is not None:
-                        # Calibration Hessian: P^T @ H @ P = H[inv_perm][:, inv_perm].
-                        # To recover H[perm][:, perm] (the permuted weight space),
-                        # index by cal_perm composed with itself.
-                        if hessian.dim() == 2:
-                            perm_sq = cal_perm[cal_perm]
-                            hessian = hessian[perm_sq][:, perm_sq]
-                        else:
-                            raise ValueError(
-                                "Calibration permutation + block-diagonal Hessian "
-                                "is not supported. Regenerate calibration data "
-                                "with the permutation applied."
-                            )
-
-                    # Rotate: H_rot = R^T @ H @ R
-                    if rot_size > 0:
-                        hessian = rotate_hessian(hessian, rot_size)
-
-                # Re-permute only for self-computed permutations.
-                if perm_applied and cal_perm is None:
-                    if hessian.dim() == 2:
-                        hessian = hessian[perm_orig][:, perm_orig]
-                    else:
-                        raise ValueError(
-                            f"PermuQuant permutation cannot be applied to "
-                            f"block-diagonal Hessian ({hessian.dim()}D, shape "
-                            f"{hessian.shape}). Regenerate calibration data "
-                            f"with the permutation applied."
-                        )
-
-                # Quantize full rotated weight; zero-energy padded columns handled by damping.
-                quantized_W, scales, zero_points = gptq_quantize_layer(
-                    W_work, hessian,
-                    block_size=gptq_block_size,
-                    damping=damping,
-                    int_bits=int_bits,
-                )
-                gptq_count += 1
-            else:
-                # Fallback to RTN if no calibration data or Hessian is missing/mismatched
-                zero_points = None
-                rtn_result = gptq_quantize_layer_rtn(
-                    W_work, int_bits=int_bits,
-                    asymmetric=asymmetric, clipping_ratios=clipping_ratios,
-                )
-                if asymmetric:
-                    quantized_W, scales, zero_points = rtn_result
-                else:
-                    quantized_W, scales = rtn_result
-                rtn_fallback += 1
-                print(f"  No calibration data, using RTN fallback")
-        elif quant_method == "ldlq":
-            # LDLQ: weight-only quantization using H = W^T @ W (no calibration needed)
-            # Quantize the full rotated weight (no truncation).
-            # LDLQ computes H = W^T @ W / M internally from the weight,
-            # so it naturally handles the padded columns.
-            quantized_W, scales = ldlq_quantize_layer(
-                W_work,
-                block_size=gptq_block_size,
-                damping=damping,
-                int_bits=int_bits,
-                iterations=ldlq_iterations,
-            )
-            gptq_count += 1
+        # MSE severity: green < 0.0001, yellow < 0.001, red >= 0.001
+        mse = info.mse
+        if mse < 0.0001:
+            mse_color = _GREEN
+        elif mse < 0.001:
+            mse_color = _YELLOW
         else:
-            # RTN: simple round-to-nearest
-            zero_points = None
-            if asymmetric:
-                if is_int8:
-                    scales, zero_points = calculate_scales_int8_asymmetric(
-                        W_work, clipping_ratios=clipping_ratios
-                    )
-                    quantized_W = quantize_weights_int8_asymmetric(
-                        W_work, scales, zero_points
-                    )
-                else:
-                    in_features = W_work.shape[1]
-                    scales, zero_points = calculate_scales_asymmetric(
-                        W_work, in_features, clipping_ratios=clipping_ratios
-                    )
-                    quantized_W = quantize_weights_asymmetric(
-                        W_work, scales, zero_points, in_features
-                    )
-            else:
-                if is_int8:
-                    scales = calculate_scales_int8(W_work, clipping_ratios=clipping_ratios)
-                    quantized_W = quantize_weights_int8(W_work, scales)
-                else:
-                    in_features = W_work.shape[1]
-                    scales = calculate_scales(W_work, in_features, clipping_ratios=clipping_ratios)
-                    quantized_W = quantize_weights(W_work, scales, in_features)
+            mse_color = _RED
 
-        # 4. Pack (INT4 only) or store directly (INT8)
-        if is_int8:
-            stored_weights = quantized_W
+        print(
+            f"  [{_c(f'{pct:5.1f}%', _pct_color(pct))}] {_c(info.layer_name, _DIM)}\n"
+            f"           {info.method:15s} "
+            f"MSE={_c(f'{mse:<12.6f}', mse_color)} "
+            f"ETA {_c(eta_str, _YELLOW)}",
+            file=sys.stderr,
+        )
+    elif isinstance(info, ProgressSummary):
+        elapsed = info.elapsed_seconds
+        if elapsed >= 60:
+            elapsed_str = f"{int(elapsed // 60)}m{int(elapsed % 60):02d}s"
         else:
-            stored_weights = pack_int4(quantized_W)
-
-        # 5. Verify: dequantize and compare to working weights
-        if zero_points is not None:
-            dequant = (quantized_W.float() - zero_points.float()) * scales.float()
-        else:
-            dequant = quantized_W.float() * scales.float()
-        mse = (W_work - dequant).pow(2).mean().item()
-        max_err = (W_work - dequant).abs().max().item()
-        bad_scales = scales.isinf().any() or scales.isnan().any() or (scales == 0).any()
-        print(f"  MSE={mse:.6f}  max_err={max_err:.4f}  scale_range=[{scales.min():.6f}, {scales.max():.6f}]  bad_scales={bad_scales}")
-        if bad_scales:
-            print(f"  WARNING: bad scales detected! inf={scales.isinf().any()} nan={scales.isnan().any()} zero={(scales == 0).any()}")
-            # Recompute scales from the quantized weights as a safety fallback
-            fix_scales = (quantized_W.float().abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-6, max=65000.0).to(torch.float16)
-            n_bad = scales.isinf().sum() + scales.isnan().sum() + (scales == 0).sum()
-            scales = torch.where(scales.isinf() | scales.isnan() | (scales == 0), fix_scales, scales)
-            print(f"  FIXED: replaced {n_bad} bad scale values")
-
-        # Store weights and scales
-        output_dict[name] = stored_weights
-        output_dict[f"{name}_scale"] = scales
-        if zero_points is not None:
-            output_dict[f"{name}_zp"] = zero_points
-
-        # ComfyUI-INT8-Fast compatibility: write comfy_quant metadata tensor
-        if comfy_compat and rot_size > 0 and is_int8:
-            import json
-            layer_prefix = name.rsplit(".weight", 1)[0]
-            comfy_quant = json.dumps({
-                "convrot": True,
-                "convrot_groupsize": rot_size,
-                "per_row": True,
-            }).encode("utf-8")
-            output_dict[f"{layer_prefix}.comfy_quant"] = torch.tensor(
-                list(comfy_quant), dtype=torch.uint8
-            )
-
-        # Store permutation if applied (only original columns, not padding)
-        if perm_applied:
-            output_dict[f"{name}.perm"] = perm_orig.to(torch.int32)
-
-        quantized += 1
-
-        # Store bias if present
-        if name.endswith(".weight"):
-            bias_key = name[:-len(".weight")] + ".bias"
-            if bias_key in state_dict:
-                output_dict[bias_key] = state_dict[bias_key]
-
-    # Save
-    output_path = os.path.join(output_dir, "model.safetensors")
-    print(f"Saving to {output_path}...")
-    save_file(output_dict, output_path, metadata=metadata)
-
-    # Summary
-    input_size = sum(t.numel() * t.element_size() for t in state_dict.values()) / (1024**3)
-    output_size = sum(
-        t.numel() * t.element_size()
-        for k, t in output_dict.items()
-        if k != "__metadata__"
-    ) / (1024**3)
-
-    print(f"\nDone! Quantized {quantized} layers, skipped {skipped} layers")
-    if use_permuquant:
-        print(f"PermuQuant applied to {permuted}/{quantized} layers")
-    if quant_method in ("gptq", "ldlq"):
-        print(f"{quant_method.upper()}: {gptq_count} layers, RTN fallback: {rtn_fallback} layers")
-    print(f"Input size: {input_size:.2f} GB")
-    print(f"Output size: {output_size:.2f} GB")
-    print(f"Compression ratio: {input_size / output_size:.2f}x")
+            elapsed_str = f"{elapsed:.1f}s"
+        summary = (
+            f"Quantized {info.total_layers} layers in {elapsed_str}, "
+            f"{info.compression_ratio:.1f}x compression"
+        )
+        print(f"\n{_c(summary, _BOLD)}", file=sys.stderr)
 
 
 def main() -> None:
@@ -454,9 +139,13 @@ def main() -> None:
                              "Default: 0)")
     parser.add_argument("--int-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bit-width: 4 (INT4) or 8 (INT8, default: 4)")
-    parser.add_argument("--group-size", type=int, default=128,
-                        help="PermuQuant group size for acceptance evaluation (default: 128). "
-                             "INT4 quantization always uses per-row scales for speed.")
+    parser.add_argument("--perm-group-size", type=int, default=128,
+                        help="PermuQuant acceptance evaluation group size (default: 128). "
+                             "Controls the granularity used when evaluating whether a channel "
+                             "permutation improves quantization error.")
+    parser.add_argument("--quant-group-size", type=int, default=128,
+                        help="RTN quantization group size (default: 128). "
+                             "Forced to per-row (in_features) for INT4 regardless of this value.")
     parser.add_argument("--permuquant", action="store_true",
                         help="Enable PermuQuant channel reordering")
     parser.add_argument("--tau", type=float, default=0.0,
@@ -475,6 +164,12 @@ def main() -> None:
                         help="GPTQ/LDLQ damping ratio (default: 0.01)")
     parser.add_argument("--ldlq-iterations", type=int, default=1,
                         help="LDLQ iterations with scale refinement (default: 1)")
+    parser.add_argument("--greedy-passes", type=int, default=0,
+                        help="Greedy local search passes after LDLQ (default: 0, recommended: 5-10)")
+    parser.add_argument("--rank-threshold", type=float, default=0.01,
+                        help="Eigenvalue threshold for low-rank greedy (default: 0.01). "
+                             "Lower values keep more eigenvalues (better quality, slower). "
+                             "Only used with --greedy-passes > 0 and Triton available.")
     parser.add_argument("--comfy-compat", action="store_true",
                         help="Write comfy_quant metadata for ComfyUI-INT8-Fast compatibility (INT8 + ConvRot only)")
     parser.add_argument("--asymmetric", action="store_true",
@@ -482,8 +177,28 @@ def main() -> None:
     parser.add_argument("--clipping-ratios", type=str, default=None,
                         help="Comma-separated clipping ratios to search for lowest-MSE scale per group. "
                              "e.g. '0.8,0.85,0.9,0.95,1.0'. Smaller ratios clip outliers for finer resolution.")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show detailed output (algorithm internals, per-layer metrics)")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress all output except warnings and errors")
+    parser.add_argument("--quality-report", type=str, default=None, metavar="REPORT.json",
+                        help="Write per-layer quantization metrics as JSON to this file "
+                             "(saved in --output directory unless an absolute path is given)")
+    parser.add_argument("--no-progress", action="store_true", default=False,
+                        help="Disable per-layer progress with ETA (default: progress is on)")
+    parser.add_argument("--seed", type=int, default=42, metavar="N",
+                        help="Random seed for reproducible output (default: 42, -1 to disable)")
 
     args = parser.parse_args()
+
+    # Configure logging
+    if args.quiet:
+        log_level = logging.WARNING
+    elif args.verbose:
+        log_level = logging.DEBUG
+    else:
+        log_level = logging.INFO
+    _configure_cli_logging(log_level)
 
     if args.rot_size != 0 and (args.rot_size & (args.rot_size - 1)) != 0:
         parser.error(f"--rot-size must be 0 or a power of 2, got {args.rot_size}")
@@ -500,11 +215,16 @@ def main() -> None:
     if args.clipping_ratios:
         clipping_ratios = [float(x.strip()) for x in args.clipping_ratios.split(",")]
 
-    quantize_model(
+    quality_report_path = args.quality_report
+    if quality_report_path and os.sep not in quality_report_path and "/" not in quality_report_path:
+        quality_report_path = os.path.join(args.output, quality_report_path)
+
+    config = QuantizeConfig(
         input_path=args.input,
         output_dir=args.output,
         rot_size=args.rot_size,
-        group_size=args.group_size,
+        perm_group_size=args.perm_group_size,
+        quant_group_size=args.quant_group_size,
         use_permuquant=args.permuquant,
         tau=args.tau,
         skip_patterns=skip_patterns,
@@ -515,10 +235,23 @@ def main() -> None:
         damping=args.damping,
         int_bits=args.int_bits,
         ldlq_iterations=args.ldlq_iterations,
+        greedy_passes=args.greedy_passes,
+        rank_threshold=args.rank_threshold,
         comfy_compat=args.comfy_compat,
         asymmetric=args.asymmetric,
         clipping_ratios=clipping_ratios,
+        quality_report_path=quality_report_path,
+        seed=args.seed,
     )
+
+    progress_callback = None
+    if not args.no_progress and not args.quiet:
+        progress_callback = _cli_progress_callback
+        # Suppress the per-layer "Quantizing ..." log line — the progress
+        # callback prints its own line with percentage, method, MSE, and ETA.
+        logger.addFilter(_PerLayerFilter())
+
+    quantize_model(config, progress_callback=progress_callback)
 
 
 if __name__ == "__main__":

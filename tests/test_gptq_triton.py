@@ -36,6 +36,7 @@ class TestGPTQTritonImports:
         assert result is None
 
 
+@pytest.mark.gpu
 class TestGPTQTritonOutputRange:
     """Tests for output value range."""
 
@@ -86,6 +87,7 @@ class TestGPTQTritonOutputRange:
         assert Q.dtype == torch.int8
 
 
+@pytest.mark.gpu
 class TestGPTQTritonMatchesReference:
     """Test that Triton kernel produces identical output to PyTorch reference."""
 
@@ -280,6 +282,7 @@ class TestGPTQTritonMatchesReference:
         )
 
 
+@pytest.mark.gpu
 class TestGPTQTritonLargerShapes:
     """Tests with larger, realistic shapes."""
 
@@ -320,6 +323,7 @@ class TestGPTQTritonLargerShapes:
         assert q_diff <= 2, f"Triton Q differs from reference. Max diff: {q_diff}"
 
 
+@pytest.mark.gpu
 class TestGPTQTritonEndToEnd:
     """End-to-end tests through gptq_quantize_layer."""
 
@@ -335,7 +339,10 @@ class TestGPTQTritonEndToEnd:
         X = torch.randn(32, N)
         H = X.T @ X
 
-        q_W, scales, _ = gptq_quantize_layer(W, H, block_size=32)
+        _qr = gptq_quantize_layer(W, H, block_size=32)
+        q_W = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert q_W.shape == (M, N)
         assert q_W.dtype == torch.int8
         assert q_W.min() >= -8
@@ -361,7 +368,10 @@ class TestGPTQTritonEndToEnd:
             blocks.append(X.T @ X)
         H_block = torch.stack(blocks)
 
-        q_W, scales, _ = gptq_quantize_layer(W, H_block)
+        _qr = gptq_quantize_layer(W, H_block)
+        q_W = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert q_W.shape == (M, N)
         assert q_W.dtype == torch.int8
         assert q_W.min() >= -8
@@ -379,7 +389,10 @@ class TestGPTQTritonEndToEnd:
         X = torch.randn(32, N)
         H = X.T @ X
 
-        q_W, scales, _ = gptq_quantize_layer(W, H, int_bits=8)
+        _qr = gptq_quantize_layer(W, H, int_bits=8)
+        q_W = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert q_W.shape == (M, N)
         assert q_W.min() >= -128
         assert q_W.max() <= 127
@@ -394,7 +407,10 @@ class TestGPTQTritonEndToEnd:
         X = torch.randn(16, N)
         H = X.T @ X
 
-        q_W, scales, _ = gptq_quantize_layer(W, H)
+        _qr = gptq_quantize_layer(W, H)
+        q_W = _qr.quantized_W
+        scales = _qr.scales
+        zero_points = _qr.zero_points
         assert torch.all(q_W == 0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -409,8 +425,14 @@ class TestGPTQTritonEndToEnd:
         X = torch.randn(128, N)
         H = X.T @ X
 
-        q_W_gptq, scales_gptq, zp_gptq = gptq_quantize_layer(W, H)
-        q_W_rtn, scales_rtn = gptq_quantize_layer_rtn(W)
+        _qr = gptq_quantize_layer(W, H)
+        q_W_gptq = _qr.quantized_W
+        scales_gptq = _qr.scales
+        zp_gptq = _qr.zero_points
+        _qr = gptq_quantize_layer_rtn(W)
+        q_W_rtn = _qr.quantized_W
+        scales_rtn = _qr.scales
+        zero_points = _qr.zero_points
 
         if zp_gptq is not None:
             W_deq_gptq = (q_W_gptq.float() - zp_gptq.float()) * scales_gptq.float()
