@@ -21,13 +21,122 @@ from .scales import (
     calculate_scales_asymmetric, quantize_weights_asymmetric,
     calculate_scales_int8_asymmetric, quantize_weights_int8_asymmetric,
 )
-from .config import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, FP16_SCALE_FLOOR, MAX_FP16_SCALE
+from .config import (
+    INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, FP16_SCALE_FLOOR, MAX_FP16_SCALE,
+    SMOOTHQUANT_AMAX_FLOOR, SMOOTHQUANT_HESSIAN_FLOOR, SANITIZE_CEIL,
+)
 from .packing import pack_int4
 from .permuquant import sweep_alpha
-from .calibration_io import load_calibration, build_name_map, get_hessian, get_permutation
+from .calibration_io import load_calibration, build_name_map, get_hessian, get_permutation, get_hessian_diag, get_per_channel_amax
 from .gptq import gptq_quantize_layer, gptq_quantize_layer_rtn
 from .ldlq import ldlq_quantize_layer
+from .piso import compute_piso_scales_int8
 from .rounding import _round_half_away_from_zero
+from .smoothquant import (
+    compute_smoothing_factors,
+    apply_smoothing_to_weight,
+    compute_smoothing_from_hessian_diag,
+    compute_smoothing_weight_only,
+)
+
+
+def _compute_smoothing_for_layer(
+    name: str,
+    name_map: dict[str, str],
+    calibration: dict | None,
+    W: torch.Tensor,
+    orig_in_features: int,
+    alpha: float,
+) -> tuple[torch.Tensor | None, str]:
+    """Compute SmoothQuant smoothing factors for a layer.
+
+    Same logic as the main-loop SmoothQuant block, but without PermuQuant
+    column reordering (since the permutation hasn't been computed yet).
+    Used by the PiSO pre-pass so that PiSO scales are computed on the
+    smoothed weight.
+
+    Returns:
+        (smoothing_factors, source) — smoothing_factors is [in_features] or
+        None if no valid factors could be computed; source is one of
+        ``"per_channel_amax"``, ``"hessian_diag"``, ``"weight_only"``.
+    """
+    layer_name = name_map.get(name)
+
+    act_amax = None
+    if layer_name is not None and calibration is not None:
+        act_amax = get_per_channel_amax(calibration, layer_name, orig_in_features)
+
+    if act_amax is not None:
+        if act_amax.shape[0] < W.shape[1]:
+            act_amax = torch.nn.functional.pad(
+                act_amax, (0, W.shape[1] - act_amax.shape[0])
+            )
+        return compute_smoothing_factors(act_amax, W, alpha=alpha), "per_channel_amax"
+
+    if calibration is not None and layer_name is not None:
+        h_diag = get_hessian_diag(calibration, layer_name, W.shape[1])
+        if h_diag is not None:
+            if h_diag.shape[0] < W.shape[1]:
+                h_diag = torch.nn.functional.pad(
+                    h_diag, (0, W.shape[1] - h_diag.shape[0])
+                )
+            n_samples = calibration.get("metadata", {}).get("num_samples", 128)
+            return (
+                compute_smoothing_from_hessian_diag(
+                    h_diag, W, alpha=alpha, num_calibration_samples=n_samples
+                ),
+                "hessian_diag",
+            )
+
+    return compute_smoothing_weight_only(W), "weight_only"
+
+
+def _transform_hessian_for_smoothquant(
+    hessian: torch.Tensor,
+    smoothing_factors: torch.Tensor,
+) -> torch.Tensor:
+    """Transform Hessian to account for SmoothQuant column scaling.
+
+    After SmoothQuant the effective input to the smoothed weight is
+    ``X̂ = X · diag(1/s)``, so the Hessian becomes::
+
+        Ĥ = X̂ᵀ X̂ = diag(1/s) · H · diag(1/s)
+
+    i.e. ``Ĥ[i,j] = H[i,j] / (s[i] · s[j])``.
+
+    For block-diagonal Hessians each block is transformed with the
+    corresponding slice of *s*.
+
+    Args:
+        hessian: 2-D ``[in, in]`` or 3-D ``[blocks, bs, bs]`` Hessian.
+        smoothing_factors: ``[in_features]`` per-channel smoothing factors.
+
+    Returns:
+        Transformed Hessian (same shape and dtype as input).
+    """
+    s = smoothing_factors.float()
+    orig_dtype = hessian.dtype
+
+    if hessian.dim() == 2:
+        s_outer = (s.unsqueeze(0) * s.unsqueeze(1)).clamp(min=SMOOTHQUANT_HESSIAN_FLOOR)
+        H_smooth = (hessian.float() / s_outer).clamp(max=SANITIZE_CEIL)
+        return H_smooth.to(orig_dtype)
+
+    if hessian.dim() == 3:
+        num_blocks, bs, _ = hessian.shape
+        H_out = hessian.float().clone()
+        for b in range(num_blocks):
+            col_start = b * bs
+            col_end = min(col_start + bs, s.shape[0])
+            actual_bs = col_end - col_start
+            s_block = s[col_start:col_end]
+            s_outer = (s_block.unsqueeze(0) * s_block.unsqueeze(1)).clamp(min=SMOOTHQUANT_HESSIAN_FLOOR)
+            H_out[b, :actual_bs, :actual_bs] = (
+                hessian[b, :actual_bs, :actual_bs].float() / s_outer
+            ).clamp(max=SANITIZE_CEIL)
+        return H_out.to(orig_dtype)
+
+    return hessian
 
 
 DEFAULT_SKIP_PATTERNS = [
@@ -95,6 +204,13 @@ def quantize_model(
     if config.int_bits not in (4, 8):
         raise ValueError(f"int_bits must be 4 or 8, got {config.int_bits}")
 
+    if config.smoothquant and config.int_bits == 4:
+        logger.warning(
+            "SmoothQuant is designed for W8A8 (INT8) quantization. "
+            "With INT4 weight-only quantization, the benefit is limited. "
+            "Consider using --int-bits 8 with --smoothquant."
+        )
+
     is_int8 = config.int_bits == 8
 
     # Seed CPU (Mersenne Twister) and CUDA (Philox) RNGs for reproducibility.
@@ -111,25 +227,99 @@ def quantize_model(
     state_dict = load_file(config.input_path)
     logger.info("Loaded %d tensors", len(state_dict))
 
-    # Load calibration data if GPTQ
+    # Load calibration data if GPTQ (or SmoothQuant needs it)
     calibration = None
     name_map = {}
-    if config.quant_method == "gptq":
+    needs_calibration = config.quant_method == "gptq" or config.smoothquant
+    if needs_calibration and config.calibration_path:
         logger.info("Loading calibration from %s...", config.calibration_path)
         calibration = load_calibration(config.calibration_path)
         cal_keys = list(calibration["hessians"].keys())
         name_map = build_name_map(list(state_dict.keys()), cal_keys)
         logger.info("Matched %d/%d calibration layers to model layers", len(name_map), len(cal_keys))
+    elif config.quant_method == "gptq" and not config.calibration_path:
+        # GPTQ requires calibration; validated below
+        pass
+
+    # ── PiSO: precompute data-aware optimal scales ──
+    piso_scales_dict: dict[str, torch.Tensor] = {}
+    if config.piso_scales and calibration is not None and is_int8:
+        # Count eligible layers first for progress reporting
+        piso_eligible = [
+            (name, tensor) for name, tensor in state_dict.items()
+            if not should_skip(name, skip_patterns)
+            and tensor.dim() == 2
+            and name_map.get(name) is not None
+            and get_hessian_diag(calibration, name_map.get(name, ""), tensor.shape[1]) is not None
+        ]
+        logger.info("PiSO: computing optimal scales for %d layers...", len(piso_eligible))
+        piso_count = 0
+        piso_start = time.monotonic()
+        for idx, (name, tensor) in enumerate(piso_eligible, 1):
+            layer_name = name_map[name]
+            h_diag = get_hessian_diag(calibration, layer_name, tensor.shape[1])
+            W = tensor.float()
+            if config.rot_size > 0:
+                W = rotate_weights(W, config.rot_size)
+
+            # Apply SmoothQuant *before* PiSO so scales are computed on the
+            # smoothed weight (the same weight GPTQ will quantize).
+            if config.smoothquant:
+                piso_sq, piso_sq_src = _compute_smoothing_for_layer(
+                    name, name_map, calibration, W, tensor.shape[1], config.smooth_alpha
+                )
+                if piso_sq is not None:
+                    W = apply_smoothing_to_weight(W, piso_sq)
+                    # Transform Hessian diagonal: ĥ_j = h_j / s_j²
+                    h_diag_raw = h_diag.float()
+                    h_diag_smooth = h_diag_raw / piso_sq.float().pow(2).clamp(min=SMOOTHQUANT_HESSIAN_FLOOR)
+                    if torch.isfinite(h_diag_smooth).all():
+                        h_diag = h_diag_smooth
+                        logger.debug("PiSO: SmoothQuant (%s) applied to %s", piso_sq_src, name)
+                    else:
+                        # Extreme smoothing factors caused non-finite Hessian
+                        # diagonal — keep untransformed h_diag but still use
+                        # smoothed weight (PiSO scales will be suboptimal but
+                        # not catastrophic).
+                        logger.warning(
+                            "PiSO: SmoothQuant Hessian diagonal has non-finite "
+                            "values for %s; using untransformed h_diag", name
+                        )
+
+            layer_start = time.monotonic()
+            try:
+                scales = compute_piso_scales_int8(W, h_diag)
+                piso_scales_dict[name] = scales
+                piso_count += 1
+            except Exception as exc:
+                logger.warning("PiSO failed for %s: %s", layer_name, exc)
+            layer_elapsed = time.monotonic() - layer_start
+            total_elapsed = time.monotonic() - piso_start
+            avg = total_elapsed / idx
+            remaining = avg * (len(piso_eligible) - idx)
+            logger.info("  PiSO [%d/%d] %s %s (%.1fs, ETA %.0fs)",
+                        idx, len(piso_eligible), name, list(tensor.shape),
+                        layer_elapsed, remaining)
+        piso_total = time.monotonic() - piso_start
+        logger.info("PiSO: computed optimal scales for %d/%d layers in %.1fs",
+                     piso_count, len(piso_eligible), piso_total)
 
     output_dict = {}
     meta_prefix = "int_crush"
     method_base = "int_crush_permuq" if config.use_permuquant else "int_crush"
+    if config.smoothquant:
+        method_base = f"{method_base}_smoothq"
     method = f"{method_base}_{config.quant_method}" if config.quant_method in ("gptq", "ldlq") else method_base
+    # GPTQ INT4 always uses asymmetric internally (hardcoded in gptq.py);
+    # GPTQ INT8 with --asymmetric also uses asymmetric; otherwise symmetric.
+    # RTN follows config.asymmetric directly.
+    gptq_int4_uses_asymmetric = (config.quant_method == "gptq" and not is_int8)
+    scale_type_is_asymmetric = config.asymmetric or gptq_int4_uses_asymmetric
     metadata = {
         f"{meta_prefix}.format_version": "3" if not is_int8 else "1",
         f"{meta_prefix}.method": method,
         f"{meta_prefix}.rot_size": str(config.rot_size),
-        f"{meta_prefix}.scale_type": "per_row_asymmetric" if (config.asymmetric and not (config.quant_method == "gptq" and is_int8)) else "per_row",
+        f"{meta_prefix}.scale_type": "per_row_asymmetric" if scale_type_is_asymmetric else "per_row",
         f"{meta_prefix}.hadamard_type": "regular",
     }
     if not is_int8:
@@ -159,6 +349,9 @@ def quantize_model(
     if config.use_permuquant:
         metadata["int_crush.permuquant"] = "true"
         metadata["int_crush.permuquant_tau"] = str(config.tau)
+    if config.piso_scales and piso_scales_dict:
+        metadata["int_crush.piso"] = "true"
+        metadata["int_crush.piso_layers"] = str(len(piso_scales_dict))
     if config.quant_method == "gptq":
         metadata[f"{meta_prefix}.gptq_block_size"] = str(config.gptq_block_size)
         metadata[f"{meta_prefix}.damping_ratio"] = str(config.damping)
@@ -169,12 +362,17 @@ def quantize_model(
         if config.greedy_passes > 0:
             metadata[f"{meta_prefix}.greedy_passes"] = str(config.greedy_passes)
             metadata[f"{meta_prefix}.rank_threshold"] = str(config.rank_threshold)
+    if config.smoothquant:
+        metadata["int_crush.smoothquant"] = "true"
+        metadata["int_crush.smooth_alpha"] = str(config.smooth_alpha)
 
     skipped = 0
     quantized = 0
     permuted = 0
     gptq_count = 0
     rtn_fallback = 0
+    piso_count = 0
+    smoothquant_count = 0
     rot_size_mismatch_warned = False
     layer_reports: list[dict] = []
 
@@ -191,13 +389,11 @@ def quantize_model(
         _loop_start = time.monotonic()
 
     for name, tensor in state_dict.items():
-        # Skip non-quantizable layers
         if should_skip(name, skip_patterns):
             output_dict[name] = tensor
             skipped += 1
             continue
 
-        # Only quantize 2D weight tensors
         if tensor.dim() != 2:
             output_dict[name] = tensor
             skipped += 1
@@ -265,6 +461,74 @@ def quantize_model(
                 else:
                     logger.debug("PermuQuant skipped (no improvement)")
 
+        # 2.5 SmoothQuant: per-channel smoothing
+        smoothing_applied = False
+        smoothing_factors = None
+        if config.smoothquant:
+            layer_name = name_map.get(name) if name_map else None
+
+            # Determine activation statistics source
+            act_amax = None
+            if layer_name is not None and calibration is not None:
+                act_amax = get_per_channel_amax(calibration, layer_name, orig_in_features)
+
+            if act_amax is not None:
+                # Primary path: per-channel amax from calibration
+                # If weight was rotated/padded, pad act_amax to match
+                if act_amax.shape[0] < W_work.shape[1]:
+                    act_amax = torch.nn.functional.pad(
+                        act_amax, (0, W_work.shape[1] - act_amax.shape[0])
+                    )
+                # If PermuQuant reordered columns, reorder act_amax to match
+                if perm_applied and perm_orig is not None:
+                    orig_features = min(orig_in_features, perm_orig.shape[0], act_amax.shape[0])
+                    act_amax_reordered = act_amax.clone()
+                    act_amax_reordered[:orig_features] = act_amax[:orig_features][perm_orig[:orig_features]]
+                    act_amax = act_amax_reordered
+                smoothing_factors = compute_smoothing_factors(
+                    act_amax, W_work, alpha=config.smooth_alpha
+                )
+                smooth_source = "per_channel_amax"
+            elif calibration is not None and layer_name is not None:
+                # Fallback: approximate from Hessian diagonal
+                h_diag = get_hessian_diag(calibration, layer_name, W_work.shape[1])
+                if h_diag is not None:
+                    # If PermuQuant reordered columns, reorder h_diag to match
+                    if perm_applied and perm_orig is not None:
+                        orig_features = min(orig_in_features, perm_orig.shape[0], h_diag.shape[0])
+                        h_diag_reordered = h_diag.clone()
+                        h_diag_reordered[:orig_features] = h_diag[:orig_features][perm_orig[:orig_features]]
+                        h_diag = h_diag_reordered
+                    # Pad to match rotated weight size
+                    if h_diag.shape[0] < W_work.shape[1]:
+                        h_diag = torch.nn.functional.pad(
+                            h_diag, (0, W_work.shape[1] - h_diag.shape[0])
+                        )
+                    # Estimate n_samples from calibration metadata
+                    n_samples = calibration.get("metadata", {}).get("num_samples", 128)
+                    smoothing_factors = compute_smoothing_from_hessian_diag(
+                        h_diag, W_work, alpha=config.smooth_alpha,
+                        num_calibration_samples=n_samples,
+                    )
+                    smooth_source = "hessian_diag"
+                    logger.debug("SmoothQuant: using Hessian-diagonal approximation for %s", name)
+                else:
+                    smoothing_factors = compute_smoothing_weight_only(W_work)
+                    smooth_source = "weight_only"
+                    logger.debug("SmoothQuant: no activation stats for %s, using weight-only", name)
+            else:
+                # No calibration at all: weight-only smoothing
+                smoothing_factors = compute_smoothing_weight_only(W_work)
+                smooth_source = "weight_only"
+                logger.debug("SmoothQuant: no calibration, using weight-only smoothing for %s", name)
+
+            if smoothing_factors is not None:
+                W_work = apply_smoothing_to_weight(W_work, smoothing_factors)
+                smoothing_applied = True
+                smoothquant_count += 1
+                logger.debug("SmoothQuant applied to %s (alpha=%.2f, source=%s)",
+                             name, config.smooth_alpha, smooth_source)
+
         zero_points = None
 
         # 3. Quantize
@@ -308,6 +572,11 @@ def quantize_model(
                         orig_features = min(orig_in_features, inv_perm.shape[0])
                         W_orig = W_work[:, :orig_features]
                         W_work[:, :orig_features] = W_orig[:, inv_perm]
+                        # Also un-permute smoothing factors so they stay
+                        # aligned with their columns.
+                        if smoothing_applied and smoothing_factors is not None:
+                            s_orig = smoothing_factors[:orig_features].clone()
+                            smoothing_factors[:orig_features] = s_orig[inv_perm]
                         perm_applied = False
                         logger.debug(
                             "PermuQuant: un-permuted W_work for block-diagonal Hessian "
@@ -315,12 +584,24 @@ def quantize_model(
                             name, hessian.dim(), hessian.shape,
                         )
 
+                # Transform Hessian for SmoothQuant.
+                # After smoothing, the effective input is X̂ = X·diag(1/s),
+                # so Ĥ = diag(1/s)·H·diag(1/s) = H[i,j] / (s[i]·s[j]).
+                if smoothing_applied and smoothing_factors is not None:
+                    hessian = _transform_hessian_for_smoothquant(
+                        hessian, smoothing_factors
+                    )
+                    logger.debug("SmoothQuant: transformed Hessian for %s", name)
+
                 # Quantize full rotated weight; zero-energy padded columns handled by damping.
                 result = gptq_quantize_layer(
                     W_work, hessian,
                     block_size=config.gptq_block_size,
                     damping=config.damping,
                     int_bits=config.int_bits,
+                    asymmetric=config.asymmetric,
+                    hessian_method=config.hessian_method,
+                    piso_scales=piso_scales_dict.get(name),
                 )
                 quantized_W = result.quantized_W
                 scales = result.scales
@@ -331,6 +612,7 @@ def quantize_model(
                 result = gptq_quantize_layer_rtn(
                     W_work, int_bits=config.int_bits,
                     asymmetric=config.asymmetric, clipping_ratios=config.clipping_ratios,
+                    piso_scales=piso_scales_dict.get(name),
                 )
                 quantized_W = result.quantized_W
                 scales = result.scales
@@ -338,10 +620,10 @@ def quantize_model(
                 rtn_fallback += 1
                 logger.debug("No calibration data, using RTN fallback")
         elif config.quant_method == "ldlq":
-            # LDLQ: weight-only quantization using H = W^T @ W (no calibration needed)
-            # Quantize the full rotated weight (no truncation).
-            # LDLQ computes H = W^T @ W / M internally from the weight,
-            # so it naturally handles the padded columns.
+            # LDLQ: weight-only quantization using H = W^T @ W (no calibration needed).
+            # Quantize the full padded weight so LDLQ's internal Hessian
+            # (computed from the same padded W) stays consistent; the
+            # zero-energy padding columns are damped away naturally.
             result = ldlq_quantize_layer(
                 W_work,
                 block_size=config.gptq_block_size,
@@ -465,6 +747,8 @@ def quantize_model(
                 "scale_range": [scales.min().item(), scales.max().item()],
                 "fallbacks": layer_fallbacks,
                 "shape": list(tensor.shape),
+                "smoothquant": smoothing_applied,
+                "smooth_source": smooth_source if smoothing_applied else None,
             })
 
         # Store weights and scales
@@ -473,6 +757,11 @@ def quantize_model(
         if zero_points is not None:
             output_dict[f"{name}_zp"] = zero_points
 
+        # Store smoothing factors for inference-side inverse absorption
+        if smoothing_applied and smoothing_factors is not None:
+            # Store only the original (unpadded) portion
+            output_dict[f"{name}_smooth"] = smoothing_factors[:orig_in_features].to(torch.float16)
+
         # ComfyUI-INT8-Fast compatibility: write comfy_quant metadata tensor
         if config.comfy_compat and config.rot_size > 0 and is_int8:
             layer_prefix = name.rsplit(".weight", 1)[0]
@@ -480,6 +769,8 @@ def quantize_model(
                 "convrot": True,
                 "convrot_groupsize": config.rot_size,
                 "per_row": True,
+                "smoothquant": config.smoothquant,
+                "smooth_alpha": config.smooth_alpha if config.smoothquant else None,
             }).encode("utf-8")
             output_dict[f"{layer_prefix}.comfy_quant"] = torch.tensor(
                 list(comfy_quant), dtype=torch.uint8
@@ -487,7 +778,7 @@ def quantize_model(
 
         # Store permutation if applied (only original columns, not padding)
         if perm_applied:
-            output_dict[f"{name}.perm"] = perm_orig.to(torch.int32)
+            output_dict[f"{name}_perm"] = perm_orig.to(torch.int32)
 
         quantized += 1
 
@@ -532,6 +823,10 @@ def quantize_model(
     logger.info("Done! Quantized %d layers, skipped %d layers", quantized, skipped)
     if config.use_permuquant:
         logger.info("PermuQuant applied to %d/%d layers", permuted, quantized)
+    if config.smoothquant:
+        logger.info("SmoothQuant applied to %d/%d layers (alpha=%.2f)", smoothquant_count, quantized, config.smooth_alpha)
+    if config.piso_scales and piso_scales_dict:
+        logger.info("PiSO: optimal scales computed for %d layers", len(piso_scales_dict))
     if config.quant_method in ("gptq", "ldlq"):
         logger.info("%s: %d layers, RTN fallback: %d layers", config.quant_method.upper(), gptq_count, rtn_fallback)
     logger.info("Input size: %.2f GB", input_size)
@@ -546,6 +841,7 @@ def quantize_model(
             permuted_layers=permuted,
             gptq_layers=gptq_count,
             rtn_fallback_layers=rtn_fallback,
+            smoothquant_layers=smoothquant_count,
             elapsed_seconds=total_elapsed,
             input_size_gb=round(input_size, 2),
             output_size_gb=round(output_size, 2),

@@ -15,7 +15,13 @@ from .scales import (
 from .config import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
 from .gptq import gptq_quantize_layer, gptq_quantize_layer_rtn
 from .ldlq import ldlq_quantize_layer
-from .calibration_io import load_calibration, build_name_map, get_hessian
+from .calibration_io import load_calibration, build_name_map, get_hessian, get_per_channel_amax
+from .smoothquant import (
+    compute_smoothing_factors,
+    apply_smoothing_to_weight,
+    compute_smoothing_from_hessian_diag,
+    compute_smoothing_weight_only,
+)
 from .types import QuantizationResult, QuantizeConfig, ProgressInfo, ProgressSummary, ProgressCallback
 
 __all__ = [
@@ -48,4 +54,9 @@ __all__ = [
     "load_calibration",
     "build_name_map",
     "get_hessian",
+    "get_per_channel_amax",
+    "compute_smoothing_factors",
+    "apply_smoothing_to_weight",
+    "compute_smoothing_from_hessian_diag",
+    "compute_smoothing_weight_only",
 ]

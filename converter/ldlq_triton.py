@@ -37,7 +37,21 @@ if _HAS_TRITON:
         BLOCK_COLS: tl.constexpr,
         BLOCK_ROWS: tl.constexpr,
     ):
-        """Triton kernel for full LDLQ block processing."""
+        """Triton kernel for full LDLQ block processing.
+
+        For each column in the block, performs:
+        1. Round-half-away-from-zero quantization with per-element scales.
+        2. Sign-flip correction — if the quantized value's sign disagrees
+           with the original weight (and |weight| > threshold), flip it.
+           Handles the ``-8 → +8`` overflow edge case by nudging to ``+7``.
+        3. Error propagation — normalised error ``err / H_inv[j,j]`` is
+           stored for the inter-block matmul and applied eagerly to
+           all later columns within the same block.
+
+        The eager intra-block propagation keeps ``Hinv_block`` in
+        registers for the entire column sweep, avoiding repeated global
+        memory loads.
+        """
         pid = tl.program_id(0)
         row_start = pid * BLOCK_ROWS
         row_offs = row_start + tl.arange(0, BLOCK_ROWS)

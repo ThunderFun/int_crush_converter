@@ -49,6 +49,8 @@ python -m converter.cli -i model.safetensors -o ./out --rot-size 256 --int-bits 
 | `--comfy-compat` | off | ComfyUI-INT8-Fast metadata, INT8 only |
 | `--asymmetric` | off | Asymmetric quantization (scale + zero-point). Better for skewed distributions |
 | `--clipping-ratios` | — | Comma-separated clipping ratios to search, e.g. `0.8,0.85,0.9,0.95,1.0`. Clips outliers for finer grid resolution |
+| `--smoothquant` | off | Per-channel smoothing before quantization (arXiv:2211.10438). Reduces per-row weight dynamic range |
+| `--smooth-alpha` | `0.5` | SmoothQuant migration strength: 0=all to weights, 1=all to activations. 0.5 works for most models |
 
 **Default skip patterns:** `embed`, `norm`, `modulation`, `lm_head`, `output`, `proj_out`
 
@@ -76,6 +78,7 @@ Single `model.safetensors` containing per-layer tensors:
 - `<name>` — `uint8` (INT4, packed 2 per byte) or `int8` (INT8)
 - `<name>_scale` — `float16` scales: `[out, num_groups]` (INT4) or `[out, 1]` (INT8)
 - `<name>.perm` — optional PermuQuant indices (`int32`)
+- `<name>_smooth` — optional SmoothQuant factors (`float16`, `[in_features]`)
 
 Metadata: `int_crush.format_version`, `int_crush.method`, `int_crush.rot_size`, `int_crush.packing_order`
 

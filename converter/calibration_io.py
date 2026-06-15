@@ -147,3 +147,88 @@ def get_permutation(calibration: dict, layer_name: str) -> torch.Tensor | None:
     if not permuquant or layer_name not in permuquant:
         return None
     return permuquant[layer_name].to(torch.int64)
+
+
+def get_per_channel_amax(
+    calibration: dict,
+    layer_name: str,
+    in_features: int,
+) -> torch.Tensor | None:
+    """Get per-channel activation amax for a layer from calibration data.
+
+    The ComfyUI-GPTQ-Calibration node stores per-channel amax under the
+    ``"amax_per_channel"`` key when SmoothQuant is enabled during calibration.
+    Each entry is a [in_features] float32 tensor with the max absolute
+    activation value per input channel across all calibration samples.
+
+    Args:
+        calibration: The loaded calibration dict
+        layer_name: Calibration layer name (without .weight suffix)
+        in_features: Expected number of input features
+
+    Returns:
+        [in_features] float32 per-channel amax, or None if not available
+    """
+    amax_store = calibration.get("amax_per_channel")
+    if not amax_store or layer_name not in amax_store:
+        return None
+    amax = amax_store[layer_name].float()
+    if amax.shape[0] >= in_features:
+        return amax[:in_features]
+    return amax
+
+
+def get_hessian_diag(calibration: dict, layer_name: str, in_features: int) -> torch.Tensor | None:
+    """Extract the Hessian diagonal for a layer from calibration data.
+
+    For block-diagonal Hessians (list of blocks), concatenates the diagonals
+    of each block.  For full Hessians (2D tensor), takes the diagonal directly.
+    Also supports a dedicated ``hessian_diag`` key if the calibration was
+    collected with PiSO enabled.
+
+    Args:
+        calibration: The loaded calibration dict
+        layer_name: Calibration layer name (without .weight suffix)
+        in_features: Expected number of input features
+
+    Returns:
+        [in_features] float32 Hessian diagonal, or None if not available
+    """
+    # Check for dedicated hessian_diag key (from PiSO-enabled calibration)
+    diag_store = calibration.get("hessian_diag")
+    if diag_store and layer_name in diag_store:
+        diag = diag_store[layer_name].float()
+        if diag.shape[0] >= in_features:
+            return diag[:in_features]
+        return diag
+
+    # Fall back to extracting diagonal from the full Hessian
+    hessians = calibration.get("hessians", {})
+    if layer_name not in hessians:
+        return None
+
+    H_raw = hessians[layer_name]
+
+    if isinstance(H_raw, list):
+        # Block-diagonal: concatenate block diagonals
+        parts = []
+        for block in H_raw:
+            if isinstance(block, torch.Tensor) and block.dim() == 2:
+                parts.append(block.diagonal())
+        if not parts:
+            return None
+        diag = torch.cat(parts).float()
+    elif isinstance(H_raw, torch.Tensor):
+        if H_raw.dim() == 2:
+            diag = H_raw.diagonal().float()
+        elif H_raw.dim() == 3:
+            # Stacked blocks [num_blocks, bs, bs]
+            diag = torch.cat([H_raw[i].diagonal() for i in range(H_raw.shape[0])]).float()
+        else:
+            return None
+    else:
+        return None
+
+    if diag.shape[0] < in_features:
+        return None
+    return diag[:in_features]

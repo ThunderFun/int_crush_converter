@@ -325,7 +325,17 @@ def _lowrank_decompose(H, rank_threshold=0.01, max_rank_frac=0.3):
 
 
 def _lowrank_decompose_svd(H, N, rank_threshold, max_rank_frac):
-    """Try svd_lowrank. Returns (s_k, U_k, k, ok) or (None, None, 0, None) on failure."""
+    """Try low-rank decomposition via ``svd_lowrank``.
+
+    Returns:
+        ``(s_k, U_k, k, ok)`` where *ok* is one of:
+        - ``True``  — low-rank succeeded; ``s_k`` and ``U_k`` are valid.
+        - ``False`` — ``svd_lowrank`` ran but the effective rank is too
+          high (> ``max_rank_frac * N`` or > ``LOWRANK_MAX_K``), or the
+          Hessian is near-zero.  Caller should fall back to full-rank.
+        - ``None``  — ``svd_lowrank`` raised (e.g. cusolver failure);
+          caller should retry with ``eigh``.
+    """
     q = min(max(N // 2, 64), N)
     try:
         U, s, V = torch.svd_lowrank(H, q=q)
@@ -345,7 +355,16 @@ def _lowrank_decompose_svd(H, N, rank_threshold, max_rank_frac):
 
 
 def _lowrank_decompose_eigh(H, N, rank_threshold, max_rank_frac):
-    """Fallback: full eigendecomposition."""
+    """Full eigendecomposition fallback for low-rank Hessian extraction.
+
+    Used when ``svd_lowrank`` fails (e.g. cusolver issues on some
+    GPU/driver combinations).  O(N³) but numerically reliable.
+
+    Returns:
+        ``(s_k, U_k, k, ok)`` with the same semantics as
+        :func:`_lowrank_decompose_svd`, except *ok* is never ``None``
+        (no fallback left to try).
+    """
     try:
         eigenvalues, eigenvectors = torch.linalg.eigh(H)
     except (torch._C._LinAlgError, RuntimeError):

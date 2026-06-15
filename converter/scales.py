@@ -175,6 +175,54 @@ def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
 # --- Asymmetric quantization (scale + zero-point per group) ---
 
 
+def _fix_asymmetric_scale(
+    scales: torch.Tensor,
+    w_min: torch.Tensor,
+    w_max: torch.Tensor,
+    qmin: int,
+    qmax: int,
+) -> torch.Tensor:
+    """Fix asymmetric scales when the zero-point would be clamped.
+
+    When ``zp = qmin - round(w_min / scale)`` falls outside ``[qmin, qmax]``,
+    the range-based scale ``(w_max - w_min) / (qmax - qmin)`` is too small for
+    the weight's absolute position.  All quantized values saturate at one end,
+    dequant ≈ 0, and the massive systematic error blows up GPTQ propagation.
+
+    The fix: increase the scale so the quantization range ``[qmin - zp, qmax - zp] * scale``
+    covers the actual weight values with the clamped zp.
+
+    Args:
+        scales:   current scales (will be increased where needed)
+        w_min:    per-row/group minimum weights
+        w_max:    per-row/group maximum weights
+        qmin:     minimum quantized value (-128 for INT8, -8 for INT4)
+        qmax:     maximum quantized value (127 for INT8, 7 for INT4)
+
+    Returns:
+        Fixed scales (same shape, same dtype).
+    """
+    spread = float(qmax - qmin)  # 255 for INT8, 15 for INT4
+    zp_raw = qmin - _round_half_away_from_zero(w_min / scales)
+
+    zp_clamp_lo = zp_raw < qmin
+    zp_clamp_hi = zp_raw > qmax
+
+    if zp_clamp_lo.any():
+        # zp clamped to qmin → quantization range is [0, spread * scale].
+        # Need spread * scale >= w_max, i.e. scale >= w_max / spread.
+        fix_scale = (w_max.float() / spread).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        scales = torch.maximum(scales, torch.where(zp_clamp_lo, fix_scale, scales))
+
+    if zp_clamp_hi.any():
+        # zp clamped to qmax → quantization range is [-spread * scale, 0].
+        # Need -spread * scale <= w_min, i.e. scale >= -w_min / spread.
+        fix_scale = (-w_min.float() / spread).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        scales = torch.maximum(scales, torch.where(zp_clamp_hi, fix_scale, scales))
+
+    return scales
+
+
 def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
                                 clipping_ratios: list[float] | None = None
                                 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -203,6 +251,7 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
 
     if clipping_ratios is None:
         scales = ((w_max - w_min).float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        scales = _fix_asymmetric_scale(scales, w_min, w_max, -8, 7)
         zero_points = (-8 - _round_half_away_from_zero(w_min / scales)).clamp(-8, 7)
         # Zero groups: set zp to 0 so zero maps to zero
         zero_groups = (w_min == 0) & (w_max == 0)
@@ -212,6 +261,7 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
     def _compute(ratio):
         range_vals = (w_max - w_min).float() * ratio
         candidate_scales = (range_vals / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        candidate_scales = _fix_asymmetric_scale(candidate_scales, w_min, w_max, -8, 7)
         candidate_zp = (-8 - _round_half_away_from_zero(w_min / candidate_scales)).clamp(-8, 7)
         q = (W_grouped / candidate_scales.unsqueeze(2)
              + candidate_zp.unsqueeze(2)).round().clamp(-8, 7)
@@ -278,6 +328,7 @@ def calculate_scales_int8_asymmetric(
 
     if clipping_ratios is None:
         scales = ((w_max - w_min).float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        scales = _fix_asymmetric_scale(scales, w_min, w_max, -128, 127)
         zero_points = (-128 - _round_half_away_from_zero(w_min / scales)).clamp(-128, 127)
         return scales.to(torch.float16), zero_points.to(torch.int16)
 
@@ -286,6 +337,7 @@ def calculate_scales_int8_asymmetric(
     def _compute(ratio):
         range_vals = (w_max - w_min).float() * ratio
         candidate_scales = (range_vals / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        candidate_scales = _fix_asymmetric_scale(candidate_scales, w_min, w_max, -128, 127)
         candidate_zp = (-128 - _round_half_away_from_zero(w_min / candidate_scales)).clamp(-128, 127)
         q = (W_3d / candidate_scales.unsqueeze(2)
              + candidate_zp.unsqueeze(2)).round().clamp(-128, 127)

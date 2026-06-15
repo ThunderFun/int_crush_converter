@@ -108,6 +108,17 @@ INITIAL_BEST_COST = 1e30
 """Initial best cost value in greedy candidate evaluation.
 Must be large enough that any real cost is lower."""
 
+# --- SmoothQuant ---
+
+SMOOTHQUANT_AMAX_FLOOR = 1e-8
+"""Minimum per-channel activation amax to prevent division by zero in
+SmoothQuant smoothing factor computation."""
+
+SMOOTHQUANT_HESSIAN_FLOOR = SMOOTHQUANT_AMAX_FLOOR ** 2
+"""Floor for the product s_i * s_j in the SmoothQuant Hessian
+transformation.  Each smoothing factor is individually clamped to
+SMOOTHQUANT_AMAX_FLOOR, so the minimum pairwise product is its square."""
+
 # --- Triton availability ---
 
 try:
@@ -133,3 +144,11 @@ GREEDY_COL_BLOCK = 64
 
 GREEDY_RECOMPUTE_EVERY = 8
 """Recompute cross terms every N columns to limit drift (greedy.py)."""
+
+TRITON_BLOCK_ROWS_PISO = 64
+"""Rows per Triton program in the PiSO grid-search kernel (piso_triton.py)."""
+
+PISO_D_BLOCK = 512
+"""Column block size for the D-dimension loop in the PiSO Triton kernel.
+Each program loads BLOCK_ROWS × D_BLOCK floats per iteration, keeping
+the working set in L2 cache across candidate evaluations."""

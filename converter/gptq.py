@@ -136,21 +136,39 @@ def _prepare_hinv(
 _gptq_prepare_hessian = _prepare_hinv
 
 
+_HESSIAN_METHODS = {
+    "hinv": _prepare_hinv,
+    "cholesky": _prepare_hessian,
+}
+
+
 def gptq_quantize_layer(
     W: torch.Tensor,
     hessian: torch.Tensor,
     block_size: int = 128,
     damping: float = 0.01,
     int_bits: int = 4,
+    asymmetric: bool = False,
+    hessian_method: str = "hinv",
+    piso_scales: torch.Tensor | None = None,
 ) -> QuantizationResult:
-    """Quantize a weight matrix using GPTQ with per-row asymmetric quantization.
+    """Quantize a weight matrix using GPTQ.
 
-    Uses asymmetric quantization (scale + zero-point) to utilize all integer
-    levels, matching the GPTQ paper's recommendation of "standard uniform
-    per-row asymmetric quantization on the min-max grid" (Section 4).
+    INT4 always uses asymmetric quantization (scale + zero-point) so all 16
+    integer levels are utilized. INT8 defaults to symmetric (scale only,
+    range [-127, 127]); pass ``asymmetric=True`` to use all 256 levels
+    asymmetric instead.
 
-    Supports both full Hessians [in, in] and block-diagonal Hessians [num_blocks, bs, bs].
-    For block-diagonal, each block is processed independently.
+    The scale is clamped to ``[FP16_SCALE_FLOOR, MAX_FP16_SCALE]`` BEFORE
+    the GPTQ column loop runs. This is essential: if the clamp happened
+    after quantization, the stored (Q, scale) pair would be internally
+    inconsistent — q values were computed with one scale but the stored
+    scale differs, so dequantization cannot recover the original weight
+    range.
+
+    Supports both full Hessians [in, in] and block-diagonal Hessians
+    [num_blocks, bs, bs]. For block-diagonal, each block is processed
+    independently.
 
     Args:
         W: [out_features, in_features] weight tensor
@@ -158,6 +176,15 @@ def gptq_quantize_layer(
         block_size: GPTQ block size for column processing
         damping: damping ratio as fraction of mean diagonal (default: 0.01)
         int_bits: quantization bit-width (4 or 8)
+        asymmetric: use asymmetric quantization. INT4 ignores this flag
+                   (always asymmetric). INT8 defaults to symmetric; pass
+                   True to use asymmetric.
+        hessian_method: "hinv" (full inverse H⁻¹) or "cholesky" (Cholesky
+                       factor of H⁻¹). Default "hinv".
+        piso_scales: Optional [out_features, 1] PiSO-optimal per-row scales.
+                     When provided, these are used instead of computing absmax
+                     scales.  The scales are clamped to the valid FP16 range
+                     before use.  See arXiv:2606.10890.
 
     Returns:
         QuantizationResult with quantized_W, scales, zero_points, method_used, and fallbacks.
@@ -166,6 +193,10 @@ def gptq_quantize_layer(
         raise ValueError(f"int_bits must be 4 or 8, got {int_bits}")
     if W.dim() != 2:
         raise ValueError(f"Expected 2D weight tensor, got {W.dim()}D")
+    if hessian_method not in _HESSIAN_METHODS:
+        raise ValueError(f"hessian_method must be one of {list(_HESSIAN_METHODS)}, got '{hessian_method}'")
+
+    prepare_fn = _HESSIAN_METHODS[hessian_method]
 
     W = W.float()
     out_features, in_features = W.shape
@@ -173,20 +204,90 @@ def gptq_quantize_layer(
     clamp_min = -128 if int_bits == 8 else -8
     clamp_max = 127 if int_bits == 8 else 7
 
-    if int_bits == 4:
-        # Asymmetric: scale = (max - min) / 15, zp = -8 - round(min / scale)
-        w_min = W.amin(dim=1, keepdim=True)
-        w_max = W.amax(dim=1, keepdim=True)
-        row_scales = ((w_max - w_min).float() / 15.0).clamp(min=FP16_SCALE_FLOOR)
-        row_zp = (-8 - _round_half_away_from_zero(w_min / row_scales)).clamp(-8, 7)
-        # Zero rows: set zp to 0 so zero maps to zero
-        zero_rows = (w_min == 0) & (w_max == 0)
-        row_zp = row_zp.masked_fill(zero_rows, 0)
-        row_zp_int8 = row_zp.to(torch.int8)
-    else:
-        # INT8: keep symmetric (scale = max / 127)
-        row_scales = (W.abs().amax(dim=1, keepdim=True) / INT8_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR)
-        row_zp_int8 = None
+    # ── PiSO scales: use data-aware optimal scales when provided ──
+    if piso_scales is not None and int_bits == 8:
+        piso = piso_scales.float().to(W.device)
+        if piso.shape == (out_features, 1):
+            row_scales = piso.clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+            row_zp_int8 = None  # PiSO + symmetric for now
+            if asymmetric:
+                # Compute zero-points from PiSO scales
+                w_min = W.amin(dim=1, keepdim=True)
+                row_zp_raw = -128 - _round_half_away_from_zero(w_min / row_scales)
+                row_zp = row_zp_raw.clamp(-128, 127)
+                zero_rows = (w_min == 0) & (W.amax(dim=1, keepdim=True) == 0)
+                row_zp = row_zp.masked_fill(zero_rows, 0)
+                row_zp_int8 = row_zp.to(torch.int8)
+            logger.debug("GPTQ: using PiSO scales for %dx%d", out_features, in_features)
+        else:
+            logger.warning("PiSO scales shape %s != (%d, 1); falling back to absmax",
+                           tuple(piso.shape), out_features)
+            piso_scales = None  # fall through to absmax
+
+    if piso_scales is None:
+        if int_bits == 4:
+            # INT4 always uses asymmetric (uses all 16 levels)
+            w_min = W.amin(dim=1, keepdim=True)
+            w_max = W.amax(dim=1, keepdim=True)
+            # Clamp scale BEFORE quantization so Q values are consistent with the
+            # stored scale. Without this, a row whose (max-min) > 975K would have
+            # its scale silently clamped to 65000 AFTER quantization, leaving Q
+            # computed against the original (unclamped) scale — which makes the
+            # saved (Q, scale) pair internally inconsistent.
+            row_scales = ((w_max - w_min).float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+            row_zp_raw = -8 - _round_half_away_from_zero(w_min / row_scales)
+            # When zp would be clamped, the range-based scale is too small for the
+            # weight's absolute position.  Increase the scale so the quantization
+            # range covers the actual weight values with the clamped zp.
+            zp_clamp_lo = row_zp_raw < -8
+            zp_clamp_hi = row_zp_raw > 7
+            if zp_clamp_lo.any():
+                fix_scale = (w_max.float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                row_scales = torch.maximum(row_scales, torch.where(zp_clamp_lo, fix_scale, row_scales))
+            if zp_clamp_hi.any():
+                fix_scale = (-w_min.float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                row_scales = torch.maximum(row_scales, torch.where(zp_clamp_hi, fix_scale, row_scales))
+            # Recompute zp with the (possibly adjusted) scale
+            row_zp = (-8 - _round_half_away_from_zero(w_min / row_scales)).clamp(-8, 7)
+            # Zero rows: set zp to 0 so zero maps to zero
+            zero_rows = (w_min == 0) & (w_max == 0)
+            row_zp = row_zp.masked_fill(zero_rows, 0)
+            row_zp_int8 = row_zp.to(torch.int8)
+        else:
+            # INT8
+            if asymmetric:
+                # Asymmetric: scale = (max - min) / 255, zp = -128 - round(min / scale).
+                # Uses all 256 levels. Clamp scale BEFORE quantization for consistency.
+                w_min = W.amin(dim=1, keepdim=True)
+                w_max = W.amax(dim=1, keepdim=True)
+                row_scales = ((w_max - w_min).float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                row_zp_raw = -128 - _round_half_away_from_zero(w_min / row_scales)
+                # When zp would be clamped, the range-based scale is too small for
+                # the weight's absolute position.  E.g., weights near 5.0 with tiny
+                # variance produce scale ≈ 1e-5 and zp ≈ -500000, clamped to -128.
+                # With the tiny scale, all Q values saturate at 127 and dequant ≈ 0,
+                # giving MSE ≈ 25 and causing GPTQ error propagation to blow up to
+                # inf.  The fix: increase the scale so the quantization range covers
+                # the actual weight values with the clamped zp.
+                zp_clamp_lo = row_zp_raw < -128
+                zp_clamp_hi = row_zp_raw > 127
+                if zp_clamp_lo.any():
+                    fix_scale = (w_max.float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                    row_scales = torch.maximum(row_scales, torch.where(zp_clamp_lo, fix_scale, row_scales))
+                if zp_clamp_hi.any():
+                    fix_scale = (-w_min.float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                    row_scales = torch.maximum(row_scales, torch.where(zp_clamp_hi, fix_scale, row_scales))
+                # Recompute zp with the (possibly adjusted) scale
+                row_zp = (-128 - _round_half_away_from_zero(w_min / row_scales)).clamp(-128, 127)
+                zero_rows = (w_min == 0) & (w_max == 0)
+                row_zp = row_zp.masked_fill(zero_rows, 0)
+                row_zp_int8 = row_zp.to(torch.int8)
+            else:
+                # Symmetric: scale = max(|W|) / 127, range [-127, 127].
+                # Uses 255 of 256 levels (the -128 level is unused). Clamp scale
+                # BEFORE quantization for consistency.
+                row_scales = (W.abs().amax(dim=1, keepdim=True) / INT8_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                row_zp_int8 = None
 
     quantized_W = torch.zeros_like(W, dtype=torch.int8)
     W_work = W.clone()
@@ -200,7 +301,7 @@ def gptq_quantize_layer(
             actual_bs = col_end - col_start
 
             H_block = hessian[bi, :actual_bs, :actual_bs].float()
-            H_chol = _gptq_prepare_hessian(H_block, damping, W.device)
+            H_chol = prepare_fn(H_block, damping, W.device)
 
             if _gptq_block_triton(
                 W_work, quantized_W, row_scales, H_chol,
@@ -222,7 +323,7 @@ def gptq_quantize_layer(
             )
 
         H = hessian.float()
-        H_chol = _gptq_prepare_hessian(H, damping, W.device)
+        H_chol = prepare_fn(H, damping, W.device)
 
         if _gptq_block_triton(
             W_work, quantized_W, row_scales, H_chol,
@@ -238,9 +339,6 @@ def gptq_quantize_layer(
             )
     else:
         raise ValueError(f"Expected 2D or 3D Hessian, got {hessian.dim()}D")
-
-    # Clamp scales to safe fp16 range (prevent div-by-zero and overflow).
-    row_scales = row_scales.clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
 
     accel = "Triton" if used_triton else "PyTorch"
     logger.debug("GPTQ: %s path, %dx%d, block_size=%d", accel, out_features, in_features, block_size)
@@ -272,6 +370,7 @@ def gptq_quantize_layer_rtn(
     int_bits: int = 4,
     asymmetric: bool = False,
     clipping_ratios: list[float] | None = None,
+    piso_scales: torch.Tensor | None = None,
 ) -> QuantizationResult:
     """Fallback: RTN quantization (no Hessian correction).
 
@@ -290,6 +389,25 @@ def gptq_quantize_layer_rtn(
         raise ValueError(f"int_bits must be 4 or 8, got {int_bits}")
 
     fallbacks: list[str] = []
+
+    # ── PiSO scales: use data-aware optimal scales when provided ──
+    if piso_scales is not None and int_bits == 8 and not asymmetric:
+        piso = piso_scales.float().to(W.device)
+        if piso.shape[0] == W.shape[0] and piso.shape[1] == 1:
+            scales = piso.clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
+            quantized = quantize_weights_int8(W, scales)
+            dequant = quantized.float() * scales.float()
+            mse = (W - dequant).pow(2).mean().item()
+            max_err = (W - dequant).abs().max().item()
+            return QuantizationResult(
+                quantized_W=quantized,
+                scales=scales,
+                zero_points=None,
+                mse=mse,
+                max_err=max_err,
+                method_used="rtn_piso",
+                fallbacks=fallbacks,
+            )
 
     if asymmetric:
         if int_bits == 8:

@@ -162,6 +162,11 @@ def main() -> None:
                         help="GPTQ block size (default: 128)")
     parser.add_argument("--damping", type=float, default=0.01,
                         help="GPTQ/LDLQ damping ratio (default: 0.01)")
+    parser.add_argument("--hessian-method", type=str, default="hinv",
+                        choices=["hinv", "cholesky"],
+                        help="Hessian preparation for GPTQ: 'hinv' (full inverse H⁻¹, default, "
+                             "generally better) or 'cholesky' (Cholesky factor of H⁻¹, "
+                             "may help on some layers)")
     parser.add_argument("--ldlq-iterations", type=int, default=1,
                         help="LDLQ iterations with scale refinement (default: 1)")
     parser.add_argument("--greedy-passes", type=int, default=0,
@@ -172,6 +177,10 @@ def main() -> None:
                              "Only used with --greedy-passes > 0 and Triton available.")
     parser.add_argument("--comfy-compat", action="store_true",
                         help="Write comfy_quant metadata for ComfyUI-INT8-Fast compatibility (INT8 + ConvRot only)")
+    parser.add_argument("--piso", action="store_true",
+                        help="Use PiSO data-aware scale optimization (requires -c calibration). "
+                             "Computes per-row scales that minimize output error using the "
+                             "Hessian diagonal. Replaces absmax scales for better INT8 quality.")
     parser.add_argument("--asymmetric", action="store_true",
                         help="Use asymmetric quantization (scale + zero-point). Improves quality for skewed distributions.")
     parser.add_argument("--clipping-ratios", type=str, default=None,
@@ -184,6 +193,14 @@ def main() -> None:
     parser.add_argument("--quality-report", type=str, default=None, metavar="REPORT.json",
                         help="Write per-layer quantization metrics as JSON to this file "
                              "(saved in --output directory unless an absolute path is given)")
+    parser.add_argument("--smoothquant", action="store_true",
+                        help="Apply SmoothQuant per-channel smoothing before quantization. "
+                             "Reduces per-row weight dynamic range by migrating activation "
+                             "outlier magnitude into weight columns. Best with -c calibration.")
+    parser.add_argument("--smooth-alpha", type=float, default=0.5,
+                        help="SmoothQuant migration strength (default: 0.5). "
+                             "0.0 = all difficulty to weights, 1.0 = all to activations. "
+                             "0.5 works for most models; use 0.75 for severe outliers.")
     parser.add_argument("--no-progress", action="store_true", default=False,
                         help="Disable per-layer progress with ETA (default: progress is on)")
     parser.add_argument("--seed", type=int, default=42, metavar="N",
@@ -233,13 +250,17 @@ def main() -> None:
         quant_method=args.quant_method,
         gptq_block_size=args.gptq_block_size,
         damping=args.damping,
+        hessian_method=args.hessian_method,
         int_bits=args.int_bits,
         ldlq_iterations=args.ldlq_iterations,
         greedy_passes=args.greedy_passes,
         rank_threshold=args.rank_threshold,
         comfy_compat=args.comfy_compat,
+        piso_scales=args.piso,
         asymmetric=args.asymmetric,
         clipping_ratios=clipping_ratios,
+        smoothquant=args.smoothquant,
+        smooth_alpha=args.smooth_alpha,
         quality_report_path=quality_report_path,
         seed=args.seed,
     )

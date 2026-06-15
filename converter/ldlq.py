@@ -188,7 +188,6 @@ def ldlq_quantize_layer(
     denominator = (Q_float * Q_float).sum(dim=1, keepdim=True).clamp(min=DENOMINATOR_FLOOR)
     final_scales = (numerator / denominator).clamp(min=FP16_SCALE_FLOOR)
 
-    # Compute MSE and max error for the result
     dequant = quantized_W.float() * final_scales.float()
     mse = (W - dequant).pow(2).mean().item()
     max_err = (W - dequant).abs().max().item()
@@ -478,8 +477,8 @@ def _run_iterative_ldlq(
                 W, Q_iter, current_scales, flat_scales, SCALE_MOMENTUM, W_NONZERO_THRESHOLD
             )
 
-        # Q_result = Q_iter (same object); intermediates are freed by
-        # overwriting Q_iter on the next iteration.
+        # Q_result holds a reference to Q_iter; on the next iteration
+        # Q_iter is reassigned (not mutated), so the old tensor is freed.
 
     if len(mse_values) > 1:
         mse_str = " ".join([f"{m:.6f}" for m in mse_values])

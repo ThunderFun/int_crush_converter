@@ -51,6 +51,10 @@ class QuantizeConfig:
     damping: float = 0.01
     """GPTQ/LDLQ damping ratio."""
 
+    hessian_method: str = "hinv"
+    """Hessian preparation for GPTQ: "hinv" (full H⁻¹, default) or
+    "cholesky" (Cholesky factor of H⁻¹, matches GPTQ paper Algorithm 1)."""
+
     int_bits: int = 4
     """Quantization bit-width (4 or 8)."""
 
@@ -72,8 +76,32 @@ class QuantizeConfig:
     clipping_ratios: list[float] | None = None
     """Clipping ratios to search for lowest MSE."""
 
+    piso_scales: bool = False
+    """Use PiSO data-aware scale optimization (requires calibration data).
+
+    Computes per-row scales that minimize output reconstruction error
+    using the Hessian diagonal from calibration.  Replaces absmax scales
+    with data-aware optimal scales.  Only effective with GPTQ or when
+    calibration data is available.  See arXiv:2606.10890."""
+
     quality_report_path: str | None = None
     """If set, write per-layer quantization metrics as JSON to this path."""
+
+    smoothquant: bool = False
+    """Apply SmoothQuant per-channel smoothing before quantization.
+
+    Computes per-input-channel smoothing factors that migrate activation
+    outlier magnitude into the weight columns, reducing per-row dynamic
+    range.  Requires calibration data for best results (per-channel amax
+    or Hessian diagonal).  See arXiv:2211.10438."""
+
+    smooth_alpha: float = 0.5
+    """SmoothQuant migration strength alpha.  Controls how much quantization
+    difficulty is migrated from activations to weights.
+
+    0.0 = all to weights, 1.0 = all to activations, 0.5 = even split.
+    Default 0.5 is the sweet spot for most models (OPT, BLOOM, LLaMA).
+    Use 0.75 for models with severe activation outliers (e.g., GLM-130B)."""
 
     seed: int = 42
     """Random seed for reproducibility. Set to -1 to disable seeding."""
@@ -180,6 +208,9 @@ class ProgressSummary:
 
     rtn_fallback_layers: int
     """Layers that fell back from GPTQ to RTN due to missing Hessian."""
+
+    smoothquant_layers: int
+    """Layers where SmoothQuant per-channel smoothing was applied."""
 
     elapsed_seconds: float
     """Total wall-clock time for the quantization loop (excludes setup and save)."""
