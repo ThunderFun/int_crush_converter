@@ -127,7 +127,7 @@ class QuantizationResult:
     """Quantized weight values as int8 (INT4 range [-8,7] or INT8 range [-128,127])."""
 
     scales: torch.Tensor
-    """Per-row (or per-group) dequantization scales, float16."""
+    """Per-row (or per-group) dequantization scales. See config.SCALE_DTYPE."""
 
     zero_points: torch.Tensor | None = None
     """Per-row (or per-group) zero-points for asymmetric quantization. None for symmetric."""

@@ -9,7 +9,10 @@ quantization by placing similar channels adjacent to each other.
 
 import torch
 
-from .config import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, MAX_FP16_SCALE, FP16_SCALE_FLOOR
+from .config import (
+    INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, SCALE_MAX, SCALE_MIN, SCALE_DTYPE,
+    MAX_FP16_SCALE,
+)
 from .rounding import _round_half_away_from_zero
 
 
@@ -70,7 +73,7 @@ def calculate_scales(W: torch.Tensor, group_size: int = 128,
                          scale per group. e.g. [0.8, 0.85, 0.9, 0.95, 1.0]
 
     Returns:
-        scales: [out_features, num_groups] float16 scales
+        scales: [out_features, num_groups] per-group scales
     """
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
@@ -82,18 +85,18 @@ def calculate_scales(W: torch.Tensor, group_size: int = 128,
     max_vals = W_grouped.abs().amax(dim=2)
 
     if clipping_ratios is None:
-        scales = (max_vals.float() / INT4_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
+        scales = (max_vals.float() / INT4_SCALE_DIVISOR).clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
         return scales
 
     def _compute(ratio):
-        candidate_scales = (max_vals.float() * ratio / INT4_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        candidate_scales = (max_vals.float() * ratio / INT4_SCALE_DIVISOR).clamp(min=SCALE_MIN, max=SCALE_MAX)
         q = (W_grouped / candidate_scales.unsqueeze(2)).round().clamp(-8, 7)
         dequant = q * candidate_scales.unsqueeze(2)
         mse = (W_grouped - dequant).pow(2).mean(dim=2)
         return candidate_scales, None, mse
 
     best_scales, _ = _search_clipping_ratio(clipping_ratios, _compute)
-    return best_scales.to(torch.float16)
+    return best_scales.to(SCALE_DTYPE)
 
 
 def quantize_weights(W: torch.Tensor, scales: torch.Tensor, group_size: int = 128) -> torch.Tensor:
@@ -130,7 +133,7 @@ def calculate_scales_int8(W: torch.Tensor,
                          scale per row. e.g. [0.8, 0.85, 0.9, 0.95, 1.0]
 
     Returns:
-        scales: [out_features, 1] float16 per-row scales
+        scales: [out_features, 1] per-row scales
     """
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
@@ -138,20 +141,20 @@ def calculate_scales_int8(W: torch.Tensor,
     max_vals = W.abs().amax(dim=1, keepdim=True)
 
     if clipping_ratios is None:
-        scales = (max_vals.float() / INT8_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
+        scales = (max_vals.float() / INT8_SCALE_DIVISOR).clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
         return scales
 
     W_3d = W.unsqueeze(1)  # [out, 1, in]
 
     def _compute(ratio):
-        candidate_scales = (max_vals.float() * ratio / INT8_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        candidate_scales = (max_vals.float() * ratio / INT8_SCALE_DIVISOR).clamp(min=SCALE_MIN, max=SCALE_MAX)
         q = (W_3d / candidate_scales.unsqueeze(2)).round().clamp(-128, 127)
         dequant = q * candidate_scales.unsqueeze(2)
         mse = (W_3d - dequant).pow(2).mean(dim=2)
         return candidate_scales, None, mse
 
     best_scales, _ = _search_clipping_ratio(clipping_ratios, _compute)
-    return best_scales.to(torch.float16)
+    return best_scales.to(SCALE_DTYPE)
 
 
 def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -211,13 +214,13 @@ def _fix_asymmetric_scale(
     if zp_clamp_lo.any():
         # zp clamped to qmin → quantization range is [0, spread * scale].
         # Need spread * scale >= w_max, i.e. scale >= w_max / spread.
-        fix_scale = (w_max.float() / spread).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        fix_scale = (w_max.float() / spread).clamp(min=SCALE_MIN, max=SCALE_MAX)
         scales = torch.maximum(scales, torch.where(zp_clamp_lo, fix_scale, scales))
 
     if zp_clamp_hi.any():
         # zp clamped to qmax → quantization range is [-spread * scale, 0].
         # Need -spread * scale <= w_min, i.e. scale >= -w_min / spread.
-        fix_scale = (-w_min.float() / spread).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        fix_scale = (-w_min.float() / spread).clamp(min=SCALE_MIN, max=SCALE_MAX)
         scales = torch.maximum(scales, torch.where(zp_clamp_hi, fix_scale, scales))
 
     return scales
@@ -236,7 +239,7 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
 
     Returns:
         (scales, zero_points):
-            scales:      [out_features, num_groups] float16
+            scales:      [out_features, num_groups] per-group scales
             zero_points: [out_features, num_groups] int8
     """
     if W.dim() != 2:
@@ -250,17 +253,17 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
     w_max = W_grouped.amax(dim=2)
 
     if clipping_ratios is None:
-        scales = ((w_max - w_min).float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        scales = ((w_max - w_min).float() / 15.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
         scales = _fix_asymmetric_scale(scales, w_min, w_max, -8, 7)
         zero_points = (-8 - _round_half_away_from_zero(w_min / scales)).clamp(-8, 7)
         # Zero groups: set zp to 0 so zero maps to zero
         zero_groups = (w_min == 0) & (w_max == 0)
         zero_points = zero_points.masked_fill(zero_groups, 0)
-        return scales.to(torch.float16), zero_points.to(torch.int8)
+        return scales.to(SCALE_DTYPE), zero_points.to(torch.int8)
 
     def _compute(ratio):
         range_vals = (w_max - w_min).float() * ratio
-        candidate_scales = (range_vals / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        candidate_scales = (range_vals / 15.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
         candidate_scales = _fix_asymmetric_scale(candidate_scales, w_min, w_max, -8, 7)
         candidate_zp = (-8 - _round_half_away_from_zero(w_min / candidate_scales)).clamp(-8, 7)
         q = (W_grouped / candidate_scales.unsqueeze(2)
@@ -270,7 +273,7 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
         return candidate_scales, candidate_zp, mse
 
     best_scales, best_zp = _search_clipping_ratio(clipping_ratios, _compute)
-    return best_scales.to(torch.float16), best_zp.to(torch.int8)
+    return best_scales.to(SCALE_DTYPE), best_zp.to(torch.int8)
 
 
 def quantize_weights_asymmetric(
@@ -317,7 +320,7 @@ def calculate_scales_int8_asymmetric(
 
     Returns:
         (scales, zero_points):
-            scales:      [out_features, 1] float16
+            scales:      [out_features, 1] per-row scales
             zero_points: [out_features, 1] int16 (int8 range [-128,127])
     """
     if W.dim() != 2:
@@ -327,16 +330,16 @@ def calculate_scales_int8_asymmetric(
     w_max = W.amax(dim=1, keepdim=True)
 
     if clipping_ratios is None:
-        scales = ((w_max - w_min).float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        scales = ((w_max - w_min).float() / 255.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
         scales = _fix_asymmetric_scale(scales, w_min, w_max, -128, 127)
         zero_points = (-128 - _round_half_away_from_zero(w_min / scales)).clamp(-128, 127)
-        return scales.to(torch.float16), zero_points.to(torch.int16)
+        return scales.to(SCALE_DTYPE), zero_points.to(torch.int16)
 
     W_3d = W.unsqueeze(1)  # [out, 1, in]
 
     def _compute(ratio):
         range_vals = (w_max - w_min).float() * ratio
-        candidate_scales = (range_vals / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        candidate_scales = (range_vals / 255.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
         candidate_scales = _fix_asymmetric_scale(candidate_scales, w_min, w_max, -128, 127)
         candidate_zp = (-128 - _round_half_away_from_zero(w_min / candidate_scales)).clamp(-128, 127)
         q = (W_3d / candidate_scales.unsqueeze(2)
@@ -346,7 +349,7 @@ def calculate_scales_int8_asymmetric(
         return candidate_scales, candidate_zp, mse
 
     best_scales, best_zp = _search_clipping_ratio(clipping_ratios, _compute)
-    return best_scales.to(torch.float16), best_zp.to(torch.int16)
+    return best_scales.to(SCALE_DTYPE), best_zp.to(torch.int16)
 
 
 def quantize_weights_int8_asymmetric(

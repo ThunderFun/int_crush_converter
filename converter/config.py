@@ -5,6 +5,8 @@ Triton kernel constants (``tl.constexpr``) cannot be imported at runtime
 and are kept inline with comments referencing these names.
 """
 
+import torch
+
 # --- Scale and numerical floors ---
 
 INT4_SCALE_DIVISOR = 7.0
@@ -15,19 +17,32 @@ INT8_SCALE_DIVISOR = 127.0
 """Divisor for symmetric INT8 scale: scale = max(|row|) / 127.0.
 Max representable positive INT8 value is 127 (range [-128, 127])."""
 
-MAX_FP16_SCALE = 65000.0
-"""Maximum safe float16 scale value. Keeps scales well below the fp16 max
-(65504) to leave headroom for dequant multiplication without overflow."""
+# --- Scale storage dtype ---
 
-FP16_SCALE_FLOOR = 1e-6
-"""Minimum scale for values cast to float16. 1e-6 is the smallest value
-that survives fp16 cast (fp16 smallest subnormal ≈ 6e-8; 1e-8 → 0.0).
-Used in scales.py for per-row/per-group scale computation."""
+SCALE_DTYPE = torch.float16
+"""Dtype for stored dequantization scales."""
+
+SMOOTH_FACTOR_DTYPE = torch.float16
+"""Dtype for stored SmoothQuant smoothing factors. These are per-input-channel
+values s_i such that the smoothed weight is W_smooth = W @ diag(s) and the
+effective activation is X_smooth = X @ diag(1/s). Stored so the inference
+engine can undo the smoothing."""
+
+SCALE_MIN = 1e-5
+"""Minimum scale value for storage. Prevents division-by-zero in dequant.
+Matches FP16 safe minimum (6e-5 normalized, 1e-5 for subnormal margin)."""
+
+SCALE_MAX = 65500.0
+"""Maximum scale value for storage."""
+
+# Legacy aliases — prefer SCALE_MIN / SCALE_MAX / SCALE_DTYPE.
+FP16_SCALE_FLOOR = SCALE_MIN
+MAX_FP16_SCALE = SCALE_MAX
 
 SCALE_FLOOR = 1e-8
 """Minimum scale value to prevent division by zero. Used in LDLQ internal
-rounding (per-element scales, not stored as float16). NOT safe for float16
-storage — use FP16_SCALE_FLOOR for any scale that will be cast to float16."""
+rounding (per-element scales, not stored externally). For stored scales,
+use SCALE_MIN."""
 
 DIAG_MEAN_FLOOR = 1e-6
 """Minimum mean diagonal value for Hessian damping. Prevents zero damping
@@ -53,6 +68,21 @@ SANITIZE_FLOOR = 1e-8
 
 SANITIZE_CEIL = 1e30
 """Replacement value for +Inf in scale sanitization."""
+
+# --- Weight outlier sanitization ---
+
+WEIGHT_OUTLIER_CLAMP = 1000.0
+"""Maximum absolute weight value before rotation/quantization.
+
+Weights exceeding this are clamped.  Normal transformer weights are in
+[-1, 1] with rare exceptions up to ~10.  Values like 2.25e33 are
+corrupted model data that would cause the per-row scale
+to blow up, making the MSE computation overflow float32
+(since ``(scale/2)² > 3.4e38`` when scale > ~3.7e19).
+
+The clamp must happen *before* the Hadamard rotation so extreme values
+don't poison an entire 256-column block.
+"""
 
 # --- Sign-flip correction ---
 

@@ -22,8 +22,9 @@ from .scales import (
     calculate_scales_int8_asymmetric, quantize_weights_int8_asymmetric,
 )
 from .config import (
-    INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, FP16_SCALE_FLOOR, MAX_FP16_SCALE,
-    SMOOTHQUANT_AMAX_FLOOR, SMOOTHQUANT_HESSIAN_FLOOR, SANITIZE_CEIL,
+    INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, SCALE_MIN, SCALE_MAX, SCALE_DTYPE,
+    SMOOTH_FACTOR_DTYPE, SMOOTHQUANT_AMAX_FLOOR, SMOOTHQUANT_HESSIAN_FLOOR, SANITIZE_CEIL,
+    WEIGHT_OUTLIER_CLAMP,
 )
 from .packing import pack_int4
 from .permuquant import sweep_alpha
@@ -404,6 +405,18 @@ def quantize_model(
         W = tensor.float()
         orig_in_features = W.shape[1]
 
+        # 0.5 Sanitize outlier weights before rotation/quantization.
+        outlier_count = 0
+        if WEIGHT_OUTLIER_CLAMP > 0:
+            outlier_mask = W.abs() > WEIGHT_OUTLIER_CLAMP
+            outlier_count = outlier_mask.sum().item()
+            if outlier_count > 0:
+                W = W.masked_fill(outlier_mask, 0.0)
+                logger.warning(
+                    "Zeroed %d outlier weight values in %s (|W| > %.0f)",
+                    outlier_count, name, WEIGHT_OUTLIER_CLAMP,
+                )
+
         # 1. Rotate weights (skip if rot_size == 0)
         #    Clone only when the downstream path mutates W_work in-place:
         #    GPTQ/LDLQ always do, and PermuQuant reorders columns.
@@ -684,7 +697,12 @@ def quantize_model(
         diff = W_work - dequant
         del dequant
         max_err = diff.abs().max().item()
-        mse = diff.pow(2).mean().item()
+        # Compute MSE in float64 to prevent overflow when weights or scales
+        # are very large.  (scale/2)² can exceed 3.4e38 (float32 max) for
+        # scales > ~3.7e19, producing inf even when quantization quality is
+        # reasonable. float64 has 53 bits of mantissa so precision
+        # is not lost for normal-magnitude errors.
+        mse = diff.double().pow(2).mean().item()
         del diff
         bad_scales = scales.isinf().any() or scales.isnan().any() or (scales == 0).any()
         logger.debug("MSE=%.6f  max_err=%.4f  scale_range=[%.6f, %.6f]  bad_scales=%s",
@@ -697,14 +715,14 @@ def quantize_model(
             # Recompute scales from W_work using the correct formula for the
             # quantization mode.
             fix_divisor = INT8_SCALE_DIVISOR if is_int8 else INT4_SCALE_DIVISOR
-            sym_scales = (W_work.float().abs().amax(dim=1, keepdim=True) / fix_divisor).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
+            sym_scales = (W_work.float().abs().amax(dim=1, keepdim=True) / fix_divisor).clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
             if zero_points is not None:
                 w_min = W_work.amin(dim=1, keepdim=True)
                 w_max = W_work.amax(dim=1, keepdim=True)
                 if is_int8:
-                    asym_scales = ((w_max - w_min).float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
+                    asym_scales = ((w_max - w_min).float() / 255.0).clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
                 else:
-                    asym_scales = ((w_max - w_min).float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
+                    asym_scales = ((w_max - w_min).float() / 15.0).clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
                 # Use asymmetric scale where it produced valid values; fall back
                 # to symmetric otherwise (e.g. when W_work itself has NaN/Inf).
                 asym_ok = bad_mask & torch.isfinite(asym_scales) & (asym_scales > 0)
@@ -760,7 +778,7 @@ def quantize_model(
         # Store smoothing factors for inference-side inverse absorption
         if smoothing_applied and smoothing_factors is not None:
             # Store only the original (unpadded) portion
-            output_dict[f"{name}_smooth"] = smoothing_factors[:orig_in_features].to(torch.float16)
+            output_dict[f"{name}_smooth"] = smoothing_factors[:orig_in_features].to(SMOOTH_FACTOR_DTYPE)
 
         # ComfyUI-INT8-Fast compatibility: write comfy_quant metadata tensor
         if config.comfy_compat and config.rot_size > 0 and is_int8:

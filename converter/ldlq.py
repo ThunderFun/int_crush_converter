@@ -16,8 +16,8 @@ from .log import logger
 from .config import (
     ABS_SCALE_FLOOR, CONVERGENCE_EPS, CONVERGENCE_IMPROVEMENT_THRESHOLD,
     DENOMINATOR_FLOOR, DIAG_MEAN_FLOOR, HINV_DIAG_FLOOR, SCALE_CEIL_MULTIPLIER,
-    SCALE_FLOOR, FP16_SCALE_FLOOR, SCALE_FLOOR_MULTIPLIER, SANITIZE_CEIL, SANITIZE_FLOOR,
-    INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, MAX_FP16_SCALE,
+    SCALE_FLOOR, SCALE_MIN, SCALE_FLOOR_MULTIPLIER, SANITIZE_CEIL, SANITIZE_FLOOR,
+    INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, SCALE_MAX, SCALE_DTYPE,
 )
 from .rounding import _invert_hessian, _ldlq_round_column
 from .types import QuantizationResult
@@ -112,15 +112,15 @@ def ldlq_quantize_layer(
     # Guard: if H has inf/nan (from extreme weight values), fall back to RTN
     if not torch.isfinite(H).all():
         logger.warning("LDLQ: Hessian has inf/nan (weight abs_max=%.2e), falling back to RTN", W.abs().max().item())
-        row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+        row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=SCALE_MIN, max=SCALE_MAX)
         q = (W / row_scales).round().clamp(clamp_min, clamp_max).to(torch.int8)
         dequant = q.float() * row_scales.float()
-        mse = (W - dequant).pow(2).mean().item()
+        mse = (W - dequant).double().pow(2).mean().item()
         max_err = (W - dequant).abs().max().item()
         fallbacks.append("hessian_nan_rtn")
         return QuantizationResult(
             quantized_W=q,
-            scales=row_scales.to(torch.float16),
+            scales=row_scales.to(SCALE_DTYPE),
             zero_points=None,
             mse=mse,
             max_err=max_err,
@@ -133,7 +133,7 @@ def ldlq_quantize_layer(
     H_inv = _invert_hessian(H)
 
     # Initial per-row scales
-    row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=FP16_SCALE_FLOOR)
+    row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=SCALE_MIN)
 
     # Expand per-row scales to per-element for the LDLQ column loop.
     flat_scales = row_scales.expand(M, N).reshape(-1).clone()
@@ -151,7 +151,7 @@ def ldlq_quantize_layer(
         Q_float = quantized_W.float()
         numerator = (Q_float * W).sum(dim=1, keepdim=True)
         denominator = (Q_float * Q_float).sum(dim=1, keepdim=True).clamp(min=DENOMINATOR_FLOOR)
-        greedy_scales = (numerator / denominator).clamp(min=FP16_SCALE_FLOOR)
+        greedy_scales = (numerator / denominator).clamp(min=SCALE_MIN)
         scale_2d = greedy_scales.expand(M, N)
 
         # Move to GPU for Triton if available (matching _single_ldlq_pass pattern)
@@ -186,10 +186,10 @@ def ldlq_quantize_layer(
     Q_float = quantized_W.float()
     numerator = (Q_float * W).sum(dim=1, keepdim=True)
     denominator = (Q_float * Q_float).sum(dim=1, keepdim=True).clamp(min=DENOMINATOR_FLOOR)
-    final_scales = (numerator / denominator).clamp(min=FP16_SCALE_FLOOR)
+    final_scales = (numerator / denominator).clamp(min=SCALE_MIN)
 
     dequant = quantized_W.float() * final_scales.float()
-    mse = (W - dequant).pow(2).mean().item()
+    mse = (W - dequant).double().pow(2).mean().item()
     max_err = (W - dequant).abs().max().item()
 
     # Determine method used (best-effort: based on device and Triton availability)
@@ -202,7 +202,7 @@ def ldlq_quantize_layer(
 
     return QuantizationResult(
         quantized_W=quantized_W,
-        scales=final_scales.to(torch.float16),
+        scales=final_scales.to(SCALE_DTYPE),
         zero_points=None,
         mse=mse,
         max_err=max_err,
@@ -448,7 +448,7 @@ def _run_iterative_ldlq(
         Q_result = Q_iter
 
         # Compute MSE
-        mse = (W - Q_iter.float() * current_scales.reshape(M, N)).abs().pow(2).mean().item()
+        mse = (W - Q_iter.float() * current_scales.reshape(M, N)).double().abs().pow(2).mean().item()
         mse_values.append(mse)
         logger.debug("LDLQ iteration %d/%d: MSE=%.6f", iter_idx + 1, iterations, mse)
 

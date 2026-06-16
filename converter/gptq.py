@@ -14,7 +14,7 @@ from .scales import (
     calculate_scales_asymmetric, quantize_weights_asymmetric,
     calculate_scales_int8_asymmetric, quantize_weights_int8_asymmetric,
 )
-from .config import DIAG_MEAN_FLOOR, SCALE_FLOOR, FP16_SCALE_FLOOR, MAX_FP16_SCALE, INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
+from .config import DIAG_MEAN_FLOOR, SCALE_FLOOR, SCALE_MIN, SCALE_MAX, SCALE_DTYPE, INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
 from .rounding import _invert_hessian, _gptq_block, _round_half_away_from_zero
 from .types import QuantizationResult
 from .gptq_triton import gptq_loop_triton, _HAS_GPTQ_TRITON
@@ -159,7 +159,7 @@ def gptq_quantize_layer(
     range [-127, 127]); pass ``asymmetric=True`` to use all 256 levels
     asymmetric instead.
 
-    The scale is clamped to ``[FP16_SCALE_FLOOR, MAX_FP16_SCALE]`` BEFORE
+    The scale is clamped to ``[SCALE_MIN, SCALE_MAX]`` BEFORE
     the GPTQ column loop runs. This is essential: if the clamp happened
     after quantization, the stored (Q, scale) pair would be internally
     inconsistent — q values were computed with one scale but the stored
@@ -208,7 +208,7 @@ def gptq_quantize_layer(
     if piso_scales is not None and int_bits == 8:
         piso = piso_scales.float().to(W.device)
         if piso.shape == (out_features, 1):
-            row_scales = piso.clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+            row_scales = piso.clamp(min=SCALE_MIN, max=SCALE_MAX)
             row_zp_int8 = None  # PiSO + symmetric for now
             if asymmetric:
                 # Compute zero-points from PiSO scales
@@ -234,7 +234,7 @@ def gptq_quantize_layer(
             # its scale silently clamped to 65000 AFTER quantization, leaving Q
             # computed against the original (unclamped) scale — which makes the
             # saved (Q, scale) pair internally inconsistent.
-            row_scales = ((w_max - w_min).float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+            row_scales = ((w_max - w_min).float() / 15.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
             row_zp_raw = -8 - _round_half_away_from_zero(w_min / row_scales)
             # When zp would be clamped, the range-based scale is too small for the
             # weight's absolute position.  Increase the scale so the quantization
@@ -242,10 +242,10 @@ def gptq_quantize_layer(
             zp_clamp_lo = row_zp_raw < -8
             zp_clamp_hi = row_zp_raw > 7
             if zp_clamp_lo.any():
-                fix_scale = (w_max.float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                fix_scale = (w_max.float() / 15.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
                 row_scales = torch.maximum(row_scales, torch.where(zp_clamp_lo, fix_scale, row_scales))
             if zp_clamp_hi.any():
-                fix_scale = (-w_min.float() / 15.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                fix_scale = (-w_min.float() / 15.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
                 row_scales = torch.maximum(row_scales, torch.where(zp_clamp_hi, fix_scale, row_scales))
             # Recompute zp with the (possibly adjusted) scale
             row_zp = (-8 - _round_half_away_from_zero(w_min / row_scales)).clamp(-8, 7)
@@ -260,7 +260,7 @@ def gptq_quantize_layer(
                 # Uses all 256 levels. Clamp scale BEFORE quantization for consistency.
                 w_min = W.amin(dim=1, keepdim=True)
                 w_max = W.amax(dim=1, keepdim=True)
-                row_scales = ((w_max - w_min).float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                row_scales = ((w_max - w_min).float() / 255.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
                 row_zp_raw = -128 - _round_half_away_from_zero(w_min / row_scales)
                 # When zp would be clamped, the range-based scale is too small for
                 # the weight's absolute position.  E.g., weights near 5.0 with tiny
@@ -272,10 +272,10 @@ def gptq_quantize_layer(
                 zp_clamp_lo = row_zp_raw < -128
                 zp_clamp_hi = row_zp_raw > 127
                 if zp_clamp_lo.any():
-                    fix_scale = (w_max.float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                    fix_scale = (w_max.float() / 255.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
                     row_scales = torch.maximum(row_scales, torch.where(zp_clamp_lo, fix_scale, row_scales))
                 if zp_clamp_hi.any():
-                    fix_scale = (-w_min.float() / 255.0).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                    fix_scale = (-w_min.float() / 255.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
                     row_scales = torch.maximum(row_scales, torch.where(zp_clamp_hi, fix_scale, row_scales))
                 # Recompute zp with the (possibly adjusted) scale
                 row_zp = (-128 - _round_half_away_from_zero(w_min / row_scales)).clamp(-128, 127)
@@ -286,7 +286,7 @@ def gptq_quantize_layer(
                 # Symmetric: scale = max(|W|) / 127, range [-127, 127].
                 # Uses 255 of 256 levels (the -128 level is unused). Clamp scale
                 # BEFORE quantization for consistency.
-                row_scales = (W.abs().amax(dim=1, keepdim=True) / INT8_SCALE_DIVISOR).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE)
+                row_scales = (W.abs().amax(dim=1, keepdim=True) / INT8_SCALE_DIVISOR).clamp(min=SCALE_MIN, max=SCALE_MAX)
                 row_zp_int8 = None
 
     quantized_W = torch.zeros_like(W, dtype=torch.int8)
@@ -349,14 +349,14 @@ def gptq_quantize_layer(
     dequant = quantized_W.float() * row_scales.float()
     if row_zp_int8 is not None:
         dequant = (quantized_W.float() - row_zp_int8.float()) * row_scales.float()
-    mse = (W - dequant).pow(2).mean().item()
+    mse = (W - dequant).double().pow(2).mean().item()
     max_err = (W - dequant).abs().max().item()
 
     method_used = "gptq_triton" if used_triton else "gptq_pytorch"
 
     return QuantizationResult(
         quantized_W=quantized_W,
-        scales=row_scales.to(torch.float16),
+        scales=row_scales.to(SCALE_DTYPE),
         zero_points=row_zp_int8,
         mse=mse,
         max_err=max_err,
@@ -394,10 +394,10 @@ def gptq_quantize_layer_rtn(
     if piso_scales is not None and int_bits == 8 and not asymmetric:
         piso = piso_scales.float().to(W.device)
         if piso.shape[0] == W.shape[0] and piso.shape[1] == 1:
-            scales = piso.clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
+            scales = piso.clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
             quantized = quantize_weights_int8(W, scales)
             dequant = quantized.float() * scales.float()
-            mse = (W - dequant).pow(2).mean().item()
+            mse = (W - dequant).double().pow(2).mean().item()
             max_err = (W - dequant).abs().max().item()
             return QuantizationResult(
                 quantized_W=quantized,
@@ -419,7 +419,7 @@ def gptq_quantize_layer_rtn(
             quantized = quantize_weights_asymmetric(W, scales, zps, in_features)
 
         dequant = (quantized.float() - zps.float()) * scales.float()
-        mse = (W - dequant).pow(2).mean().item()
+        mse = (W - dequant).double().pow(2).mean().item()
         max_err = (W - dequant).abs().max().item()
 
         return QuantizationResult(
@@ -441,7 +441,7 @@ def gptq_quantize_layer_rtn(
         quantized = quantize_weights(W, scales, in_features)
 
     dequant = quantized.float() * scales.float()
-    mse = (W - dequant).pow(2).mean().item()
+    mse = (W - dequant).double().pow(2).mean().item()
     max_err = (W - dequant).abs().max().item()
 
     return QuantizationResult(
