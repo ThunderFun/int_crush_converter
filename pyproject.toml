@@ -19,6 +19,7 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 int-crush-convert = "converter.cli:main"
+int-crush-benchmark = "converter.benchmark_cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

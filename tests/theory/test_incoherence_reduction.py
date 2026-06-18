@@ -1,23 +1,11 @@
 """Test: ConvRot reduces incoherence parameter mu."""
 
-import math
 import torch
 
 from converter.rotation import rotate_weights, rotate_hessian
 
 
 class TestIncoherenceReduction:
-
-    def test_incoherence_definition(self):
-        torch.manual_seed(42)
-        M, N = 32, 128
-        W = torch.randn(M, N)
-
-        max_entry = W.abs().max().item()
-        fro_norm = W.norm().item()
-        expected_mu = max_entry * math.sqrt(M * N) / fro_norm
-
-        assert 1.0 < expected_mu < 5.0, f"Random Gaussian should have mu~2, got {expected_mu:.2f}"
 
     def test_rotation_preserves_incoherence_for_uniform(self):
         torch.manual_seed(42)

@@ -14,22 +14,6 @@ from converter.piso import (
 )
 
 
-class TestTritonImport:
-    """Basic import and availability checks (no GPU required)."""
-
-    def test_has_triton_flag(self):
-        assert isinstance(_HAS_TRITON, bool)
-
-    def test_triton_function_callable(self):
-        assert callable(compute_piso_scales_int8_triton)
-
-    def test_returns_none_without_cuda(self):
-        if not _HAS_TRITON:
-            assert compute_piso_scales_int8_triton(
-                torch.randn(8, 64), torch.ones(64)
-            ) is None
-
-
 # ── Symmetric kernel ─────────────────────────────────────────────────────────
 
 

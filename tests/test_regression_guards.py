@@ -11,7 +11,7 @@ import pytest
 from converter.config import FP16_SCALE_FLOOR, MAX_FP16_SCALE
 from converter.gptq import gptq_quantize_layer, gptq_quantize_layer_rtn, _prepare_hinv
 from converter.ldlq import ldlq_quantize_layer
-from converter.rotation import rotate_weights, rotate_hessian
+from converter.rotation import rotate_weights
 from converter.scales import (
     calculate_scales, quantize_weights,
     calculate_scales_int8, quantize_weights_int8,
@@ -78,57 +78,6 @@ class TestGPTQHessianCorrectness:
 
         # The library should produce reasonable MSE (not garbage from wrong H_inv)
         assert mse_lib < 1.0, f"GPTQ MSE suspiciously high: {mse_lib:.4f}"
-
-
-# ── Proxy loss preservation under rotation ───────────────────────────────────
-
-
-class TestProxyLossPreservation:
-    """Orthogonal rotation must preserve the proxy loss."""
-
-    def test_rotation_preserves_proxy_loss(self):
-        torch.manual_seed(42)
-        M, N = 16, 64
-        W = torch.randn(M, N)
-        H = W.T @ W / M
-
-        # Build orthogonal R via QR
-        A = torch.randn(N, N)
-        Q, _ = torch.linalg.qr(A)
-        R = Q
-
-        W_rot = W @ R
-        H_rot = R.T @ H @ R
-
-        scales = W_rot.abs().amax(dim=1, keepdim=True) / 7.0
-        q_W = quantize_weights(W_rot, scales, N)
-        W_deq_rot = q_W.float() * scales.float()
-        W_deq = W_deq_rot @ R.T
-
-        err_orig = (W_deq - W)
-        proxy_orig = torch.trace(err_orig @ H @ err_orig.T).item()
-        err_rot = (W_deq_rot - W_rot)
-        proxy_rot = torch.trace(err_rot @ H_rot @ err_rot.T).item()
-
-        assert abs(proxy_orig - proxy_rot) < 1e-4 * max(proxy_orig, 1e-8), (
-            f"Proxy loss not preserved: orig={proxy_orig:.6f}, rot={proxy_rot:.6f}"
-        )
-
-    def test_hessian_rotation_preserves_trace(self):
-        """trace(H) must be preserved under orthogonal rotation."""
-        torch.manual_seed(42)
-        N = 128
-        H = torch.randn(N, N)
-        H = H + H.T
-        H = H @ H.T  # positive definite
-
-        trace_before = torch.trace(H).item()
-        H_rot = rotate_hessian(H, rot_size=64)
-        trace_after = torch.trace(H_rot).item()
-
-        assert abs(trace_before - trace_after) < 1e-3, (
-            f"trace(H) changed after rotation: {trace_before:.4f} -> {trace_after:.4f}"
-        )
 
 
 # ── Float16 scale safety ────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 """Shared rounding and Hessian utilities for GPTQ and LDLQ.
 
-Provides the core column-by-column quantization loop used by both GPTQ
-(calibration-based Hessian) and LDLQ (weight-only Hessian W^T W).
+Core column-by-column quantization loop used by both GPTQ (calibration
+Hessian) and LDLQ (weight-only H = W^T W).
 
 Two rounding modes:
 - GPTQ: per-row scales, banker's rounding, lazy batch error propagation
@@ -120,9 +120,8 @@ def _ldlq_round_column(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """LDLQ rounding with sign-flip correction.
 
-    Uses per-element scales, round-half-away-from-zero, and corrects sign
-    mismatches between the weight and quantized value (important when scales
-    are refined across iterations).
+    Per-element scales, round-half-away-from-zero. Corrects sign mismatches
+    between weight and quantized value (important with iterative scale refinement).
 
     Args:
         col: [M] weight column
@@ -139,18 +138,10 @@ def _ldlq_round_column(
     q = _round_half_away_from_zero(y)
     q = q.clamp(float(clamp_min), float(clamp_max))
 
-    # Sign-flip correction: if the weight and quantized value have different
-    # signs (and the weight is not near zero), flip the quantized value.
-    #
-    # Why this is needed: iterative scale refinement (the outer loop in
-    # ldlq.py → _run_iterative_ldlq) adjusts scales per-column.  For
-    # near-zero weights the refined scale can become small enough that
-    # round(W/s) lands on the *opposite* side of zero from W — i.e.
-    # round(+0.04 / 0.03) → +1 but after a scale tweak round(+0.04 /
-    # 0.05) → 0, then round(+0.04 / 0.02) → +2, etc.  When the sign
-    # does flip, the subsequent Hessian-weighted error propagation
-    # amplifies the bias.  Clamping the quantized value to match the
-    # original weight sign eliminates this drift.
+    # Sign-flip correction: iterative scale refinement can make round(W/s)
+    # land on the opposite side of zero for near-zero weights. The subsequent
+    # Hessian-weighted error propagation amplifies this bias. Clamping the
+    # quantized value to match the original sign eliminates the drift.
     W_sign = torch.where(col.abs() > SIGN_FLIP_THRESHOLD, col.sign(), q.sign())
     should_flip = (W_sign * q.sign()) < 0
     # Prevent -8 -> +8 overflow: nudge stuck -8 values to +7

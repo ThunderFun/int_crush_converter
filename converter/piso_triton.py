@@ -1,19 +1,14 @@
-"""Triton-accelerated PiSO (Piecewise Scale Optimization) kernels.
+"""Triton-accelerated PiSO kernels (arXiv:2606.10890).
 
-Fuses the candidate-scale evaluation loop into a single kernel launch,
-eliminating the O(B×C×D) intermediate tensors of the PyTorch path.
+Fuses candidate-scale evaluation into one kernel launch, eliminating
+O(B×C×D) intermediates of the PyTorch path.
 
 Two kernels:
-- Symmetric INT8: ``_piso_symmetric_kernel`` — evaluates coarse+fine candidate
-  scales, picks the Hessian-weighted optimal per row.
-- Asymmetric INT8: ``_piso_asymmetric_kernel`` — same, but also optimizes
-  the zero-point per candidate.
+- Symmetric INT8: evaluates coarse+fine candidate scales, picks Hessian-weighted optimum per row.
+- Asymmetric INT8: same, also optimizes zero-point per candidate.
 
-Both kernels iterate over D in blocks of ``D_BLOCK`` (constexpr) to handle
-arbitrary weight widths, keeping each block in L2 cache across candidate
-evaluations (candidate-major, D-minor loop order).  This uses only 3
-registers per row (running_cost, best_cost, best_scale) instead of the
-O(C×D) intermediates of the broadcast approach.
+Candidate-major, D-minor loop order keeps W in L2 cache across evaluations.
+Only 3 registers per row (running_cost, best_cost, best_scale) vs O(C×D) broadcast.
 """
 
 import torch

@@ -1,9 +1,7 @@
 """Triton-accelerated GPTQ block kernel.
 
-Processes one full block of columns in a single kernel launch, keeping
-Hinv_block in registers for the entire block. Supports INT4 and INT8
-via constexpr parameters, and asymmetric quantization via optional
-zero-point vector.
+Fuses full block column processing into one kernel launch, keeping Hinv_block
+in registers. Supports INT4/INT8 via constexpr params and asymmetric via optional zero-point.
 """
 
 import torch

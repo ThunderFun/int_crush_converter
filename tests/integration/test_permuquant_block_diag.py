@@ -5,55 +5,18 @@ import os
 
 import pytest
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
 from converter.pipeline import quantize_model
 from converter.types import QuantizeConfig
 
 
-def _make_tiny_safetensors(path: str, layer_names=None, shapes=None) -> str:
-    if layer_names is None:
-        layer_names = ["layers.0.q_proj.weight", "layers.0.k_proj.weight"]
-    if shapes is None:
-        shapes = [(16, 64), (16, 64)]
-    state = {}
-    for name, shape in zip(layer_names, shapes):
-        state[name] = torch.randn(*shape, dtype=torch.float32)
-    save_file(state, path)
-    return path
-
-
-def _make_block_diagonal_calibration(path, layer_names, in_features_list, block_size=16):
-    hessians = {}
-    shapes = {}
-    layer_types = {}
-    for name, in_feat in zip(layer_names, in_features_list):
-        num_blocks = (in_feat + block_size - 1) // block_size
-        blocks = []
-        for _ in range(num_blocks):
-            X = torch.randn(32, block_size)
-            blocks.append(X.T @ X)
-        hessians[name] = torch.stack(blocks)
-        shapes[name] = [in_feat, in_feat]
-        layer_types[name] = "linear"
-    data = {
-        "hessians": hessians, "shapes": shapes,
-        "layer_types": layer_types, "metadata": {},
-    }
-    torch.save(data, path)
-    return path
-
-
 class TestPermuQuantBlockDiagonal:
 
-    def test_permuquant_block_diagonal_no_crash(self, tmp_path):
-        input_path = str(tmp_path / "input.safetensors")
+    def test_permuquant_block_diagonal_no_crash(self, tmp_path, tmp_safetensors, tmp_calibration):
+        input_path = tmp_safetensors()
         output_dir = str(tmp_path / "output")
-        cal_path = str(tmp_path / "cal.pt")
-
-        _make_tiny_safetensors(input_path)
-        _make_block_diagonal_calibration(
-            cal_path,
+        cal_path = tmp_calibration(
             layer_names=["layers.0.q_proj", "layers.0.k_proj"],
             in_features_list=[64, 64],
             block_size=16,
@@ -70,18 +33,13 @@ class TestPermuQuantBlockDiagonal:
             assert name in result
             assert name.replace(".weight", ".weight_scale") in result
 
-    def test_permuquant_block_diagonal_warns(self, tmp_path, caplog):
-        input_path = str(tmp_path / "input.safetensors")
-        output_dir = str(tmp_path / "output")
-        cal_path = str(tmp_path / "cal.pt")
-
-        _make_tiny_safetensors(
-            input_path,
+    def test_permuquant_block_diagonal_warns(self, tmp_path, caplog, tmp_safetensors, tmp_calibration):
+        input_path = tmp_safetensors(
             layer_names=["layers.0.q_proj.weight"],
             shapes=[(16, 64)],
         )
-        _make_block_diagonal_calibration(
-            cal_path,
+        output_dir = str(tmp_path / "output")
+        cal_path = tmp_calibration(
             layer_names=["layers.0.q_proj"],
             in_features_list=[64],
             block_size=16,

@@ -100,11 +100,56 @@ class QuantizeConfig:
     difficulty is migrated from activations to weights.
 
     0.0 = all to weights, 1.0 = all to activations, 0.5 = even split.
-    Default 0.5 is the sweet spot for most models (OPT, BLOOM, LLaMA).
-    Use 0.75 for models with severe activation outliers (e.g., GLM-130B)."""
+    Default 0.5 works well for most architectures. Use 0.75 for models
+    with severe activation outliers."""
 
     seed: int = 42
     """Random seed for reproducibility. Set to -1 to disable seeding."""
+
+    smoothrot: bool = False
+    """Explicit confirmation of smooth-then-rotate pipeline order.
+
+    Smooth-then-rotate is now the **default** pipeline order when
+    ``smoothquant=True`` and ``rot_size > 0``.  This flag enables
+    additional FFN-pair-specific optimizations (pair detection,
+    ``smoothrot_factors`` storage) but is not required for the correct
+    order.
+
+    When enabled, the pipeline detects FFN up/down pairs, computes
+    smoothing factors for the down-projection, and stores them as
+    ``{name}_smoothrot_factors`` tensors for inference-side ``1/s``
+    application (before the online Hadamard).
+
+    Automatically disabled for ``int_bits=4`` (W4) unless
+    ``force_smoothrot_w4=True``."""
+
+    smoothrot_alpha: float | None = None
+    """SmoothRot migration strength.  If ``None``, inherits ``smooth_alpha``.
+
+    The SmoothRot paper recommends per-model tuning in the 0.45–0.6 range.
+    Test with the ablation suite for your target architecture."""
+
+    force_smoothrot_w4: bool = False
+    """Force-enable SmoothRot for W4 (INT4) quantization despite the safeguard.
+
+    NOT recommended — SmoothRot can hurt quality at W4 due to limited
+    INT4 dynamic range (only 16 levels).  Use only for experimentation."""
+
+    svd_rank: int = 0
+    """SVD-absorbed low-rank branch rank. 0 = disabled (default).
+
+    When enabled, each 2D weight is decomposed as::
+
+        W ≈ L1 @ L2 + residual
+
+    where L1 [out, r] and L2 [r, in] are stored in FP16 and the
+    residual is quantized normally.  The low-rank branch absorbs the
+    dominant singular values, leaving a cleaner residual with lower
+    dynamic range for quantization.
+
+    Typical values: 16 (INT8), 32 (INT4).  Based on SVDQuant
+    (arXiv:2411.05007).  Adds two FP16 tensors per layer at
+    negligible inference overhead."""
 
 
 @dataclass
@@ -212,6 +257,9 @@ class ProgressSummary:
     smoothquant_layers: int
     """Layers where SmoothQuant per-channel smoothing was applied."""
 
+    svd_layers: int
+    """Layers where SVD-absorbed low-rank decomposition was applied."""
+
     elapsed_seconds: float
     """Total wall-clock time for the quantization loop (excludes setup and save)."""
 
@@ -248,3 +296,156 @@ class ProgressCallback(Protocol):
     """
 
     def __call__(self, info: ProgressInfo | ProgressSummary) -> None: ...
+
+
+# ── Benchmark types ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class BenchmarkConfig:
+    """Configuration for :func:`benchmark_method` / :func:`benchmark_matrix`."""
+
+    method: str
+    """Quantization method: ``"rtn"``, ``"gptq"``, or ``"ldlq"``."""
+
+    int_bits: int
+    """Quantization bit-width (4 or 8)."""
+
+    features: str = "plain"
+    """Feature preset string (see :data:`FEATURE_PRESETS` for valid values)."""
+
+    rot_size: int = 0
+    """Hadamard rotation group size. 0 = no rotation, 64/256 for ConvRot."""
+
+    smooth_alpha: float = 0.5
+    """SmoothQuant / SmoothRot migration strength."""
+
+    svd_rank: int = 0
+    """SVD-absorbed low-rank branch rank. 0 = disabled."""
+
+    perm_group_size: int = 128
+    """PermuQuant acceptance evaluation group size."""
+
+    tau: float = 0.0
+    """PermuQuant acceptance threshold."""
+
+    asymmetric: bool = False
+    """Use asymmetric quantization (scale + zero-point)."""
+
+    gptq_block_size: int = 128
+    """GPTQ/LDLQ block size."""
+
+    damping: float = 0.01
+    """GPTQ/LDLQ damping ratio."""
+
+    hessian_method: str = "hinv"
+    """Hessian preparation for GPTQ: ``"hinv"`` or ``"cholesky"``."""
+
+    ldlq_iterations: int = 1
+    """Number of LDLQ iterations with scale refinement."""
+
+    greedy_passes: int = 0
+    """LDLQ greedy coordinate descent passes (0 = disabled)."""
+
+    rank_threshold: float = 0.01
+    """Eigenvalue threshold for low-rank greedy."""
+
+    clipping_ratios: list[float] | None = None
+    """Scale search ratios for lowest-MSE clipping."""
+
+    force_smoothrot_w4: bool = False
+    """Allow SmoothRot at INT4 (not recommended)."""
+
+    skip_patterns: list[str] | None = None
+    """Custom skip patterns. None → use :data:`DEFAULT_SKIP_PATTERNS`."""
+
+    seed: int = 42
+    """Random seed for reproducibility."""
+
+
+@dataclass
+class LayerBenchmarkResult:
+    """Result for a single layer under one method config."""
+
+    name: str
+    """State-dict key (e.g. ``"layers.0.q_proj.weight"``)."""
+
+    shape: tuple[int, int]
+    """Weight tensor shape ``(out_features, in_features)``."""
+
+    weight_mse: float
+    """Relative MSE: ``||W - W_deq||² / ||W||²``."""
+
+    weight_max_err: float
+    """Relative max error: ``max|W - W_deq| / max|W|``."""
+
+    output_mse: float | None
+    """Relative output MSE (if activations provided). None otherwise."""
+
+    snr_db: float
+    """Signal-to-noise ratio in dB."""
+
+    method_used: str
+    """Backend that produced this result (e.g. ``"rtn"``, ``"gptq_triton"``)."""
+
+    fallbacks: list[str]
+    """Fallbacks triggered (e.g. ``["oom_cpu"]``)."""
+
+    smooth_source: str | None
+    """Smoothing source: ``"per_channel_amax"``, ``"hessian_diag"``,
+    ``"weight_only"``, ``"smoothrot"``, or ``None``."""
+
+    permutation_applied: bool
+    """True if PermuQuant reordered columns."""
+
+    svd_rank: int
+    """0 if SVD not applied, else the rank used."""
+
+
+@dataclass
+class MethodBenchmarkResult:
+    """Result for one (method, bits, features) combo across all layers."""
+
+    config: BenchmarkConfig
+    """The benchmark configuration used."""
+
+    layers: list[LayerBenchmarkResult]
+    """Per-layer results."""
+
+    mse_mean: float
+    """Mean ``weight_mse`` across layers (relative)."""
+
+    mse_p95: float
+    """95th percentile ``weight_mse``."""
+
+    max_err: float
+    """Maximum ``weight_max_err`` across layers."""
+
+    output_mse_mean: float | None
+    """Mean ``output_mse`` across layers (if activations provided)."""
+
+    elapsed_seconds: float
+    """Wall-clock time for this combo."""
+
+    error: str | None
+    """Error message if the whole combo failed. None on success."""
+
+
+@dataclass
+class BenchmarkReport:
+    """Full side-by-side comparison of all method combos."""
+
+    model_path: str | None
+    """Path to input safetensors (None for synthetic)."""
+
+    calibration_path: str | None
+    """Path to calibration .pt file (None if not provided)."""
+
+    num_layers: int
+    """Number of quantized layers."""
+
+    layer_shapes: dict[str, tuple]
+    """Mapping from layer name to shape tuple."""
+
+    results: list[MethodBenchmarkResult]
+    """Per-combo results, sorted by ``mse_mean``."""

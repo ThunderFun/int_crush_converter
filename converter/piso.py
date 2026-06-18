@@ -1,25 +1,15 @@
-"""PiSO: Piecewise-Optimal Scale Optimization for Post-Training Quantization.
+"""PiSO: Piecewise-Optimal Scale Optimization (arXiv:2606.10890).
 
-Computes data-aware per-row quantization scales that minimize the output
-reconstruction error ``||Xw - X * quant(w/s)||²`` using the Hessian
-``H = X^T X`` collected during calibration.
+Computes data-aware per-row scales minimizing output reconstruction error
+||Xw - X * quant(w/s)||² using the Hessian diagonal H = X^T X.
+Unlike absmax scales, PiSO accounts for how quantization error propagates
+through the Hessian.
 
-Unlike absmax scales (``s = max(|w|) / Q``), PiSO scales account for how
-each weight's quantization error propagates through the Hessian, producing
-scales that minimize the *output* error rather than the *weight* error.
+Algorithm: coarse-to-fine grid search. The proxy objective E(s) = ||diag(h) * (w - s*q(s))||²
+is piecewise quadratic in s, so a dense grid reliably finds the global minimum.
+Diagonal approximation H ≈ diag(diag(H)) for O(D|G|) per-channel complexity.
 
-Reference: "Optimal Post-Training Quantization Scales and Where to Find Them"
-(arXiv:2606.10890).  This implementation uses the diagonal approximation
-``H ≈ diag(diag(H))`` for O(D|G|) per-channel complexity.
-
-Algorithm: coarse-to-fine grid search over candidate scales.  The proxy
-objective ``E(s) = ||diag(h) * (w - s*q(s))||²`` is piecewise quadratic
-in s, so evaluating at a dense grid of candidates reliably finds the global
-minimum (or very close to it).  Each evaluation is vectorized over D weights.
-
-Backend selection: Triton GPU (fastest) → PyTorch (fallback).  The Triton
-kernel fuses the candidate evaluation into a single launch, eliminating the
-O(B×C×D) intermediates of the broadcast approach.
+Backend: Triton GPU (fastest) → PyTorch (fallback).
 """
 
 import torch

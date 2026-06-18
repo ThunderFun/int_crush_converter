@@ -1,9 +1,7 @@
 """Triton-accelerated LDLQ block kernel.
 
-Processes one full block of columns in a single kernel launch, fusing the
-per-column quantize + sign-flip + error-propagate loop.
-
-Greedy local search kernels have been moved to :mod:`converter.greedy`.
+Fuses per-column quantize + sign-flip + error-propagate into one kernel launch.
+Greedy local search kernels live in :mod:`converter.greedy`.
 """
 
 import torch

@@ -22,6 +22,8 @@ from .smoothquant import (
     compute_smoothing_from_hessian_diag,
     compute_smoothing_weight_only,
 )
+from .smoothrot import detect_ffn_pairs, FFNPair
+from .svd import decompose_weight, SVDResult
 from .types import QuantizationResult, QuantizeConfig, ProgressInfo, ProgressSummary, ProgressCallback
 
 __all__ = [
@@ -59,4 +61,8 @@ __all__ = [
     "apply_smoothing_to_weight",
     "compute_smoothing_from_hessian_diag",
     "compute_smoothing_weight_only",
+    "detect_ffn_pairs",
+    "FFNPair",
+    "decompose_weight",
+    "SVDResult",
 ]

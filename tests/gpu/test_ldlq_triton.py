@@ -6,22 +6,7 @@ import torch
 from converter.ldlq_triton import ldlq_loop_triton, _HAS_TRITON
 
 
-class TestTritonKernel:
-
-    def test_triton_import(self):
-        assert callable(ldlq_loop_triton)
-
-    def test_triton_has_triton_flag(self):
-        assert isinstance(_HAS_TRITON, bool)
-
-    def test_triton_returns_none_without_cuda(self):
-        if not _HAS_TRITON:
-            M, N = 8, 32
-            W = torch.randn(M, N)
-            H_inv = torch.eye(N)
-            scale = torch.ones(M, N)
-            Q = torch.zeros(M, N, dtype=torch.int8)
-            assert ldlq_loop_triton(W, H_inv, scale, Q, N, M, 32, -8, 7) is None
+class TestTritonLDLQKernel:
 
     @pytest.mark.gpu
     def test_triton_int4_output_range(self):

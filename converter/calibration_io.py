@@ -64,14 +64,9 @@ def build_name_map(state_dict_keys: list[str], calibration_keys: list[str]) -> d
 def get_hessian(calibration: dict, layer_name: str, weight_shape: torch.Size) -> torch.Tensor | None:
     """Get the Hessian tensor for a layer.
 
-    Returns the raw Hessian — either 2D [in, in] (full) or 3D [blocks, bs, bs] (block-diagonal).
-    The caller (gptq_quantize_layer) handles both formats.
-
-    Supports both the legacy stacked-tensor format and the newer list-of-blocks
-    format from ComfyUI-GPTQ-Calibration (where the last block retains its
-    true size instead of being zero-padded).  Lists are auto-stacked into a
-    3D tensor with zero-padded last block; downstream code already slices
-    ``[:actual_bs, :actual_bs]`` so the padding is harmless.
+    Returns raw Hessian — 2D [in, in] (full) or 3D [blocks, bs, bs] (block-diagonal).
+    Supports legacy stacked-tensor format and newer list-of-blocks format from
+    ComfyUI-GPTQ-Calibration (last block retains true size, zero-padded on stack).
 
     Args:
         calibration: The loaded calibration dict

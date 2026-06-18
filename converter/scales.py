@@ -1,10 +1,7 @@
-"""Per-row scale calculation and quantization for INT-Crush INT4/INT8.
+"""Per-row scale calculation and quantization for INT4/INT8.
 
-Per-row quantization computes one scale per row:
-    scale[row] = max(|W[row, :]) / Q
-
-This is the foundation for PermuQuant channel reordering, which improves
-quantization by placing similar channels adjacent to each other.
+Per-row: scale[row] = max(|W[row,:]|) / Q_max.
+Foundation for PermuQuant channel reordering (similar channels adjacent).
 """
 
 import torch

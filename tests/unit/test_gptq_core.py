@@ -6,16 +6,12 @@ import pytest
 from converter.gptq import gptq_quantize_layer
 from converter.config import MAX_FP16_SCALE, FP16_SCALE_FLOOR
 from converter.scales import calculate_scales, quantize_weights, calculate_scales_int8, quantize_weights_int8
+from tests.conftest import make_hessian
 
 
-def _make_hessian(in_features: int, rank_deficient: bool = False) -> torch.Tensor:
-    """Create a realistic positive-definite Hessian matrix."""
-    X = torch.randn(64, in_features)
-    H = X.T @ X
-    if rank_deficient:
-        H[-1, :] = 0
-        H[:, -1] = 0
-    return H
+def _make_hessian(in_features: int) -> torch.Tensor:
+    """Create a realistic Hessian using current RNG state (no re-seed)."""
+    return make_hessian(in_features, seed=None, num_samples=64)
 
 
 # ── INT4 core ────────────────────────────────────────────────────────────────

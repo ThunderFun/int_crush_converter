@@ -1,12 +1,8 @@
-"""PermuQuant: Channel reordering for quantization.
+"""PermuQuant: Channel reordering for quantization (arXiv:2605.09503).
 
-Implements the core permutation logic from PermuQuant (arXiv:2605.09503):
-  1. Second-moment based channel reordering
-  2. Joint activation + weight statistics
-  3. Calibration-based acceptance rule
-
-The permutation is absorbed offline into weights and adjacent modules,
-so it introduces zero runtime overhead.
+Core logic: second-moment based channel reordering, joint activation+weight
+statistics, calibration-based acceptance rule. Permutation is absorbed offline
+into weights and adjacent modules — zero runtime overhead.
 """
 
 import torch

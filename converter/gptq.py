@@ -1,4 +1,4 @@
-"""GPTQ: Accurate Post-Training Quantization (Frantar et al., ICLR 2023).
+"""GPTQ: Accurate Post-Training Quantization (Frantar et al., ICLR 2023, arXiv:2210.17323).
 
 Block-wise quantization using Hessian information to optimally redistribute
 quantization error to remaining unquantized columns.
@@ -91,16 +91,12 @@ def _prepare_hessian(
     damping: float,
     device: torch.device,
 ) -> torch.Tensor:
-    """Compute Cholesky of H⁻¹ per GPTQ paper Algorithm 1.
+    """Compute Cholesky of H⁻¹ per GPTQ Algorithm 1 (arXiv:2210.17323).
 
-    Intuition for *why* H⁻¹ and not H: the GPTQ column-update rule
-    needs the inverse Hessian to compute δ = −H⁻¹[:,j] · err / H⁻¹[j,j].
-    Rather than forming the full dense H⁻¹, Algorithm 1 (Frantar et al.,
-    arXiv:2210.17323) stores only Cholesky(H⁻¹) and recovers individual
-    columns of H⁻¹ via forward-solve — O(n²) per column instead of O(n³).
-    The upper-triangular factor L.T is cached here; the per-column
-    extraction happens in the main loop below.
-    Falls back to full inverse if Cholesky fails (non-positive-definite H⁻¹).
+    The column-update rule needs H⁻¹ to compute δ = −H⁻¹[:,j] · err / H⁻¹[j,j].
+    Algorithm 1 stores only Cholesky(H⁻¹) and recovers columns via forward-solve
+    — O(n²) per column instead of O(n³). Caches upper-triangular L.T here.
+    Falls back to full inverse if Cholesky fails.
     """
     diag_mean = H_block.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
     H_damped = H_block + damping * diag_mean * torch.eye(H_block.shape[0], dtype=torch.float32)

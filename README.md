@@ -49,8 +49,11 @@ python -m converter.cli -i model.safetensors -o ./out --rot-size 256 --int-bits 
 | `--comfy-compat` | off | ComfyUI-INT8-Fast metadata, INT8 only |
 | `--asymmetric` | off | Asymmetric quantization (scale + zero-point). Better for skewed distributions |
 | `--clipping-ratios` | — | Comma-separated clipping ratios to search, e.g. `0.8,0.85,0.9,0.95,1.0`. Clips outliers for finer grid resolution |
-| `--smoothquant` | off | Per-channel smoothing before quantization (arXiv:2211.10438). Reduces per-row weight dynamic range |
+| `--smoothquant` | off | Per-channel smoothing before quantization. Reduces per-row weight dynamic range |
 | `--smooth-alpha` | `0.5` | SmoothQuant migration strength: 0=all to weights, 1=all to activations. 0.5 works for most models |
+| `--smoothrot` | off | Explicit confirmation of smooth-then-rotate order (default when `--smoothquant` + `--rot-size > 0`). Enables FFN pair detection and `smoothrot_factors` storage |
+| `--smoothrot-alpha` | inherits `--smooth-alpha` | SmoothRot migration strength. |
+| `--force-smoothrot-w4` | off | Force smooth-then-rotate for W4 despite quality risk. |
 
 **Default skip patterns:** `embed`, `norm`, `modulation`, `lm_head`, `output`, `proj_out`
 
@@ -79,6 +82,7 @@ Single `model.safetensors` containing per-layer tensors:
 - `<name>_scale` — `float16` scales: `[out, num_groups]` (INT4) or `[out, 1]` (INT8)
 - `<name>.perm` — optional PermuQuant indices (`int32`)
 - `<name>_smooth` — optional SmoothQuant factors (`float16`, `[in_features]`)
+- `<name>_smoothrot_factors` — optional SmoothRot factors (`float16`, `[in_features]`, applied before Hadamard at inference)
 
 Metadata: `int_crush.format_version`, `int_crush.method`, `int_crush.rot_size`, `int_crush.packing_order`
 
@@ -101,6 +105,31 @@ Contains:
 - `perm-group-size` and `quant-group-size` must be power of 2 ≥ 32. INT4 only; INT8 always uses one scale per row.
 - GPTQ falls back to RTN for layers without calibration data.
 
+
+## Benchmark CLI
+
+Compare quantization methods side-by-side on the same weights.
+
+```bash
+python -m converter.benchmark_cli -i model.safetensors -v --max-layers 4 --rot-size 256
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-i, --input` | — | Input `.safetensors` (required unless `--synthetic`) |
+| `-c, --calibration` | — | Calibration `.pt` file |
+| `-o, --output` | — | Write JSON report to this path |
+| `--synthetic` | off | Use synthetic weights (no `--input` needed) |
+| `--layers` | `8` | Number of synthetic layers |
+| `--shape` | `64,256` | Synthetic layer shape as `out,in` |
+| `--methods` | `rtn,gptq,ldlq` | Comma-separated methods to test |
+| `--int-bits` | `4,8` | Comma-separated bit-widths |
+| `--features` | all | Comma-separated feature presets (e.g. `plain,convrot,smoothrot`) |
+| `--rot-size` | — | Override Hadamard `rot_size` for rotation presets |
+| `--max-layers` | — | Limit to N random quantizable layers (for speed) |
+| `--seed` | `42` | Random seed |
+| `-v, --verbose` | off | Show per-layer details |
+| `-q, --quiet` | off | Suppress table, only write JSON |
 
 ## Tests
 

@@ -1,11 +1,23 @@
-"""Named constants for the INT-Crush quantization algorithms.
+"""Named constants for the converter algorithms.
 
-Centralizes magic numbers so they're documented and easy to tune.
-Triton kernel constants (``tl.constexpr``) cannot be imported at runtime
-and are kept inline with comments referencing these names.
+Centralizes magic numbers for documentation and tuning.
+Triton ``tl.constexpr`` constants are kept inline (can't be imported at runtime).
 """
 
 import torch
+
+# --- Default skip patterns ---
+
+DEFAULT_SKIP_PATTERNS = [
+    "embed",
+    "norm",
+    "modulation",
+    "lm_head",
+    "output",
+    "proj_out",
+]
+"""Layer name substrings that cause a layer to be skipped (stored unquantized).
+Used by :func:`pipeline.should_skip` and :mod:`converter.benchmark`."""
 
 # --- Scale and numerical floors ---
 
@@ -23,10 +35,8 @@ SCALE_DTYPE = torch.float16
 """Dtype for stored dequantization scales."""
 
 SMOOTH_FACTOR_DTYPE = torch.float16
-"""Dtype for stored SmoothQuant smoothing factors. These are per-input-channel
-values s_i such that the smoothed weight is W_smooth = W @ diag(s) and the
-effective activation is X_smooth = X @ diag(1/s). Stored so the inference
-engine can undo the smoothing."""
+"""Dtype for stored SmoothQuant smoothing factors (per-input-channel s_i).
+Effective weight: W_smooth = W @ diag(s); activation: X_smooth = X @ diag(1/s)."""
 
 SCALE_MIN = 1e-5
 """Minimum scale value for storage. Prevents division-by-zero in dequant.
@@ -41,8 +51,7 @@ MAX_FP16_SCALE = SCALE_MAX
 
 SCALE_FLOOR = 1e-8
 """Minimum scale value to prevent division by zero. Used in LDLQ internal
-rounding (per-element scales, not stored externally). For stored scales,
-use SCALE_MIN."""
+rounding (per-element, not stored). For stored scales, use SCALE_MIN."""
 
 DIAG_MEAN_FLOOR = 1e-6
 """Minimum mean diagonal value for Hessian damping. Prevents zero damping
@@ -74,14 +83,10 @@ SANITIZE_CEIL = 1e30
 WEIGHT_OUTLIER_CLAMP = 1000.0
 """Maximum absolute weight value before rotation/quantization.
 
-Weights exceeding this are clamped.  Normal transformer weights are in
-[-1, 1] with rare exceptions up to ~10.  Values like 2.25e33 are
-corrupted model data that would cause the per-row scale
-to blow up, making the MSE computation overflow float32
-(since ``(scale/2)² > 3.4e38`` when scale > ~3.7e19).
-
-The clamp must happen *before* the Hadamard rotation so extreme values
-don't poison an entire 256-column block.
+Normal transformer weights are in [-1, 1] with rare exceptions up to ~10.
+Values like 2.25e33 are corrupted data that blow up per-row scales and
+overflow float32 MSE computation. Clamp *before* Hadamard rotation so
+extreme values don't poison an entire 256-column block.
 """
 
 # --- Sign-flip correction ---

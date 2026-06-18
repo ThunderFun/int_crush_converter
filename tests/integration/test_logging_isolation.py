@@ -4,18 +4,8 @@ import logging
 
 import pytest
 import torch
-from safetensors.torch import save_file
 
 from converter.log import logger
-
-
-def _make_tiny_safetensors(path: str) -> str:
-    state = {
-        "layers.0.q_proj.weight": torch.randn(16, 64, dtype=torch.float32),
-        "layers.0.k_proj.weight": torch.randn(16, 64, dtype=torch.float32),
-    }
-    save_file(state, path)
-    return path
 
 
 class TestLoggingIsolation:
@@ -35,14 +25,13 @@ class TestLoggingIsolation:
             "Package logger should have a NullHandler"
         )
 
-    def test_cli_main_configures_package_logger(self, tmp_path, monkeypatch):
+    def test_cli_main_configures_package_logger(self, tmp_path, monkeypatch, tmp_safetensors):
         from converter.cli import main
 
         logger.handlers.clear()
 
-        input_path = str(tmp_path / "input.safetensors")
+        input_path = tmp_safetensors()
         output_dir = str(tmp_path / "output")
-        _make_tiny_safetensors(input_path)
 
         monkeypatch.setattr("sys.argv", [
             "int-crush-convert", "-i", input_path, "-o", output_dir, "--quiet",
@@ -58,14 +47,13 @@ class TestLoggingIsolation:
             "CLI main() should have added a StreamHandler to the package logger"
         )
 
-    def test_cli_logging_produces_output(self, tmp_path, monkeypatch, capsys):
+    def test_cli_logging_produces_output(self, tmp_path, monkeypatch, capsys, tmp_safetensors):
         from converter.cli import main
 
         logger.handlers.clear()
 
-        input_path = str(tmp_path / "input.safetensors")
+        input_path = tmp_safetensors()
         output_dir = str(tmp_path / "output")
-        _make_tiny_safetensors(input_path)
 
         monkeypatch.setattr("sys.argv", [
             "int-crush-convert", "-i", input_path, "-o", output_dir,

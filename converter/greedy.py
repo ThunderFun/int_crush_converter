@@ -1,20 +1,15 @@
 """Greedy local search for quantization grid optimization.
 
-Implements coordinate descent on the quantization grid, trying all representable
-INT values at each position and picking the one that minimizes proxy loss
+Coordinate descent on the quantization grid: tries all representable INT
+values at each position, picks the one minimizing proxy loss
 tr((W_hat - W) H (W_hat - W)^T).
 
 Three backends (fastest first):
-1. Low-rank Triton — fused kernel with low-rank Hessian approximation.
-   Processes B=64 columns per launch. Best when H is approximately
-   low-rank (typical for diffusion transformer weights).
+1. Low-rank Triton — fused kernel with low-rank Hessian approximation (B=64 cols/launch).
 2. Full-rank Triton (v2) — batched cross terms + rank-1 corrections.
-   Falls back when effective rank is too high for low-rank.
 3. PyTorch — per-column matmul (fallback, always available).
 
-References:
-    QuIP (Chee et al., 2023, arXiv:2307.13304): greedy local search as
-    a post-processing step after LDLQ.
+Ref: QuIP (Chee et al., 2023, arXiv:2307.13304) — greedy as post-processing after LDLQ.
 """
 
 import torch

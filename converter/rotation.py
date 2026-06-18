@@ -1,11 +1,8 @@
-"""Hadamard Transform for ConvRot quantization.
+"""Hadamard Transform for ConvRot quantization (arXiv:2512.03673).
 
 Applies group-wise Hadamard rotation to weight matrices and activations.
-Uses dense Regular Hadamard matmul (power of 4) or Sylvester construction
-(any power of 2).
-
-Based on ConvRot (arXiv:2512.03673) — rotation suppresses outliers before
-quantization, making simple RTN effective for INT4.
+Uses Regular Hadamard (power of 4) or Sylvester fallback (any power of 2).
+Rotation suppresses outliers before quantization, making RTN effective for INT4.
 """
 
 import math
@@ -40,20 +37,17 @@ def make_hadamard_sylvester(n: int, dtype: torch.dtype = torch.float16, device: 
 
 
 def make_hadamard_regular(n: int, dtype: torch.dtype = torch.float16, device: str = "cpu") -> torch.Tensor:
-    """Construct a normalized Regular Hadamard matrix of size n.
+    """Construct a normalized Regular Hadamard matrix of size n (power of 4).
 
-    A Regular Hadamard matrix has all row sums equal (±1 when normalized),
-    which prevents row-wise outlier aggregation during rotation.
-    Construction: Kronecker product of H_4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]
-    normalized by 1/2 at each step. Must be a power of 4 (4, 16, 64, 256, ...).
+    Regular Hadamard = equal row sums (±1), preventing row-wise outlier
+    aggregation. Built by Kronecker product of the 4×4 kernel H_4 from
+    ConvRot (arXiv:2512.03673, Theorem 3.2), normalized by 1/2 per step.
     """
     if not _is_power_of_four(n):
         raise ValueError(f"Regular Hadamard requires power of 4, got {n}. Use rot_size=16/64/256.")
 
-    # The 4×4 regular Hadamard kernel H_4 below is the matrix from
     # ConvRot (Ashkboos et al., arXiv:2512.03673), Theorem 3.2.
-    # Each row sums to +1 (after the /2 normalisation), guaranteeing
-    # the equal-row-sum property that defines a *regular* Hadamard matrix.
+    # Each row sums to +1 after /2 normalisation → regular Hadamard.
     H4 = torch.tensor([
         [ 1.0,  1.0,  1.0, -1.0],
         [ 1.0,  1.0, -1.0,  1.0],
@@ -86,10 +80,9 @@ def clear_hadamard_cache() -> None:
 
 
 def _apply_hadamard(x: torch.Tensor, rot_size: int) -> torch.Tensor:
-    """Apply Hadamard transform to the last dimension of x.
+    """Apply group-wise Hadamard transform to the last dimension of x.
 
-    Uses Regular Hadamard for powers of 4 (ConvRot paper) to prevent
-    row-wise outlier aggregation. Falls back to Sylvester for non-power-of-4.
+    Uses Regular Hadamard for powers of 4 (ConvRot paper); Sylvester fallback.
     """
     if _is_power_of_four(rot_size):
         H = get_hadamard(rot_size, dtype=x.dtype, device=str(x.device))
@@ -161,22 +154,18 @@ def rotate_activations(x: torch.Tensor, rot_size: int) -> torch.Tensor:
 
 
 def rotate_hessian(H: torch.Tensor, rot_size: int) -> torch.Tensor:
-    """Rotate a Hessian matrix to match rotated weight space: H_rot = R^T @ H @ R.
+    """Rotate a Hessian to match rotated weight space: H_rot = R^T @ H @ R.
 
-    The calibration Hessian is computed from unrotated activations (original model).
-    Since the weights are rotated as W_rot = W @ R, the Hessian must be transformed
-    as H_rot = R^T @ H @ R so that GPTQ's error compensation is in the correct space.
-
-    R is a block-diagonal matrix of Hadamard blocks (orthogonal: R^T @ R = I).
-
-    Supports both full Hessians [in, in] and block-diagonal Hessians [num_blocks, bs, bs].
+    Since W_rot = W @ R, the Hessian must transform as H_rot = R^T @ H @ R
+    so GPTQ's error compensation operates in the correct space.
+    R is block-diagonal Hadamard (orthogonal: R^T @ R = I).
 
     Args:
-        H: Hessian matrix — 2D [in, in] or 3D [num_blocks, bs, bs]
-        rot_size: Hadamard block size
+        H: 2D [in, in] or 3D [num_blocks, bs, bs] Hessian.
+        rot_size: Hadamard block size.
 
     Returns:
-        H_rotated: Hessian in rotated weight space (same shape as input)
+        Hessian in rotated weight space (same shape as input).
     """
     if not _is_power_of_two(rot_size):
         raise ValueError(f"rot_size must be a power of 2, got {rot_size}")

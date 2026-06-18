@@ -26,15 +26,11 @@ from .ldlq_triton import ldlq_loop_triton
 
 
 _ldlq_compiled_fn = None
-# torch.compile requires PyTorch 2.0+; guard for older versions.
-_HAS_TORCH_COMPILE = hasattr(torch, "compile")
+_HAS_TORCH_COMPILE = hasattr(torch, "compile")  # PyTorch 2.0+
 
 
 def _get_ldlq_compiled_fn():
-    """Lazily create a torch.compile'd LDLQ column body function.
-
-    Fuses ~10 GPU kernels per column into 1-2 compiled kernels.
-    """
+    """Lazily compile LDLQ column body with torch.compile (fuses ~10 ops → 1-2 kernels)."""
     global _ldlq_compiled_fn
     if _ldlq_compiled_fn is not None:
         return _ldlq_compiled_fn
@@ -64,8 +60,40 @@ def _get_ldlq_compiled_fn():
     return _ldlq_compiled_fn
 
 
+def _invert_block_diagonal_hessian(
+    hessian: torch.Tensor, N: int, damping: float,
+) -> torch.Tensor:
+    """Invert a block-diagonal Hessian into a full N×N inverse matrix.
+
+    Each block is damped and inverted independently.  The result is a dense
+    ``[N, N]`` matrix whose off-block-diagonal entries are zero, ready for
+    the LDLQ column loop.
+
+    Args:
+        hessian: ``[num_blocks, bs, bs]`` block-diagonal Hessian.
+        N: total column dimension (may be larger than ``num_blocks * bs``
+            if the last block is partial).
+        damping: damping ratio as fraction of per-block mean diagonal.
+
+    Returns:
+        ``[N, N]`` float32 inverse Hessian.
+    """
+    num_blocks, bs, _ = hessian.shape
+    H_inv = torch.zeros(N, N, dtype=torch.float32)
+    for bi in range(num_blocks):
+        col_start = bi * bs
+        col_end = min(col_start + bs, N)
+        actual_bs = col_end - col_start
+        H_block = hessian[bi, :actual_bs, :actual_bs].float()
+        diag_mean = H_block.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
+        H_block_damped = H_block + damping * diag_mean * torch.eye(actual_bs, dtype=torch.float32)
+        H_inv[col_start:col_end, col_start:col_end] = _invert_hessian(H_block_damped)
+    return H_inv
+
+
 def ldlq_quantize_layer(
     W: torch.Tensor,
+    hessian: torch.Tensor | None = None,
     block_size: int = 128,
     damping: float = 0.01,
     int_bits: int = 4,
@@ -73,13 +101,21 @@ def ldlq_quantize_layer(
     greedy_passes: int = 0,
     rank_threshold: float = 0.01,
 ) -> QuantizationResult:
-    """Quantize a weight matrix using LDLQ (weight-only, no calibration).
+    """Quantize a weight matrix using LDLQ.
 
-    Computes H = W^T @ W / M as the Hessian, then runs the GPTQ column loop
-    with per-element scales and sign-flip correction.
+    Supports two Hessian sources:
+    - **Calibration Hessian** (recommended): ``hessian = E_x[xx^T]`` from
+      calibration data, same as GPTQ.  This is what the QuIP papers use and
+      gives genuinely better results than RTN.
+    - **Weight-only** (fallback): when ``hessian=None``, computes
+      ``H = W^T @ W / M``.  This is *not* what the papers describe and
+      can perform worse than RTN because the error propagation targets
+      the wrong directions.  Pass a calibration Hessian whenever possible.
 
     Args:
         W: [out_features, in_features] weight tensor
+        hessian: Proxy Hessian — 2D [in, in] or 3D [blocks, bs, bs].
+            If None, falls back to H = W^T @ W / M (weight-only, not recommended).
         block_size: block size for column processing
         damping: damping ratio as fraction of mean diagonal (default: 0.01)
         int_bits: quantization bit-width (4 or 8)
@@ -106,31 +142,55 @@ def ldlq_quantize_layer(
 
     fallbacks: list[str] = []
 
-    # Compute Hessian from weights: H = W^T @ W / M
-    H = W.T @ W / M
-
-    # Guard: if H has inf/nan (from extreme weight values), fall back to RTN
-    if not torch.isfinite(H).all():
-        logger.warning("LDLQ: Hessian has inf/nan (weight abs_max=%.2e), falling back to RTN", W.abs().max().item())
-        row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=SCALE_MIN, max=SCALE_MAX)
-        q = (W / row_scales).round().clamp(clamp_min, clamp_max).to(torch.int8)
-        dequant = q.float() * row_scales.float()
-        mse = (W - dequant).double().pow(2).mean().item()
-        max_err = (W - dequant).abs().max().item()
-        fallbacks.append("hessian_nan_rtn")
-        return QuantizationResult(
-            quantized_W=q,
-            scales=row_scales.to(SCALE_DTYPE),
-            zero_points=None,
-            mse=mse,
-            max_err=max_err,
-            method_used="rtn",
-            fallbacks=fallbacks,
+    # ── Compute or accept Hessian ──
+    if hessian is not None:
+        hessian = hessian.float()
+        if hessian.dim() == 3:
+            # Block-diagonal Hessian: invert per-block into a full N×N matrix.
+            H_inv = _invert_block_diagonal_hessian(hessian, N, damping)
+        elif hessian.dim() == 2:
+            if hessian.shape != (N, N):
+                raise ValueError(
+                    f"Hessian shape {hessian.shape} != ({N}, {N})"
+                )
+            diag_mean = hessian.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
+            H_damped = hessian + damping * diag_mean * torch.eye(N, dtype=torch.float32)
+            H_inv = _invert_hessian(H_damped)
+        else:
+            raise ValueError(f"Expected 2D or 3D Hessian, got {hessian.dim()}D")
+    else:
+        # Fallback: weight-only Hessian (not what the papers describe).
+        import warnings
+        warnings.warn(
+            "LDLQ: no calibration Hessian provided; using H = W^T W / M. "
+            "This can perform worse than RTN. Pass a calibration Hessian "
+            "from GPTQ calibration data for best results.",
+            stacklevel=2,
         )
+        H = W.T @ W / M
 
-    diag_mean = H.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
-    H = H + damping * diag_mean * torch.eye(N, dtype=torch.float32)
-    H_inv = _invert_hessian(H)
+        # Guard: if H has inf/nan (from extreme weight values), fall back to RTN
+        if not torch.isfinite(H).all():
+            logger.warning("LDLQ: Hessian has inf/nan (weight abs_max=%.2e), falling back to RTN", W.abs().max().item())
+            row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=SCALE_MIN, max=SCALE_MAX)
+            q = (W / row_scales).round().clamp(clamp_min, clamp_max).to(torch.int8)
+            dequant = q.float() * row_scales.float()
+            mse = (W - dequant).double().pow(2).mean().item()
+            max_err = (W - dequant).abs().max().item()
+            fallbacks.append("hessian_nan_rtn")
+            return QuantizationResult(
+                quantized_W=q,
+                scales=row_scales.to(SCALE_DTYPE),
+                zero_points=None,
+                mse=mse,
+                max_err=max_err,
+                method_used="rtn",
+                fallbacks=fallbacks,
+            )
+
+        diag_mean = H.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
+        H = H + damping * diag_mean * torch.eye(N, dtype=torch.float32)
+        H_inv = _invert_hessian(H)
 
     # Initial per-row scales
     row_scales = (W.abs().amax(dim=1, keepdim=True) / scale_divisor).clamp(min=SCALE_MIN)
@@ -221,14 +281,8 @@ def _single_ldlq_pass(
 ) -> torch.Tensor:
     """Single pass of LDLQ quantization with OOM fallback.
 
-    Allocates work tensors on CUDA when available, falling back to CPU on
-    out-of-memory.  On GPU, selects the fastest available backend:
-
-    1. **Triton** — fuses the per-column quantize + sign-flip + error-propagate
-       loop into a single kernel launch per block (fastest).
-    2. **torch.compile** — fuses ~10 PyTorch ops per column into 1-2 compiled
-       kernels (good, but still Python-level column loop).
-    3. **Eager** — plain PyTorch (slowest, always available).
+    Allocates on CUDA when available, falls back to CPU on OOM.
+    Backend priority: Triton (fused kernel) → torch.compile → eager PyTorch.
 
     Args:
         W: [M, N] weight tensor (float32)
@@ -422,9 +476,8 @@ def _run_iterative_ldlq(
     """Run iterative LDLQ with scale refinement.
 
     Each iteration re-estimates per-element scales from the quantized result,
-    then re-runs LDLQ. Convergence is detected when MSE improvement drops
-    below 0.01%. Divergence detection reverts to previous scales if MSE
-    increases by more than 5%.
+    then re-runs LDLQ. Converges when MSE improvement < 0.01%. Divergence
+    detection reverts if MSE increases by > 5%.
     """
     M, N = W.shape
     current_scales = flat_scales.clone()
@@ -496,9 +549,9 @@ def _update_ldlq_scales(
 ) -> torch.Tensor:
     """Update scales for next LDLQ iteration.
 
-    For valid (nonzero, sign-consistent) elements: new_scale = |W| / |Q|.
-    For mismatched elements: revert to original flat scales.
-    Momentum blending prevents oscillation.
+    Valid (nonzero, sign-consistent) elements: new_scale = |W| / |Q|.
+    Mismatched elements: revert to original flat scales.
+    Momentum blending (default 0.3) prevents oscillation.
     """
     W_flat = W.reshape(-1)
     Q_flat = Q_iter.reshape(-1).float()

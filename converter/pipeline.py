@@ -24,7 +24,7 @@ from .scales import (
 from .config import (
     INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR, SCALE_MIN, SCALE_MAX, SCALE_DTYPE,
     SMOOTH_FACTOR_DTYPE, SMOOTHQUANT_AMAX_FLOOR, SMOOTHQUANT_HESSIAN_FLOOR, SANITIZE_CEIL,
-    WEIGHT_OUTLIER_CLAMP,
+    WEIGHT_OUTLIER_CLAMP, DEFAULT_SKIP_PATTERNS,
 )
 from .packing import pack_int4
 from .permuquant import sweep_alpha
@@ -39,6 +39,8 @@ from .smoothquant import (
     compute_smoothing_from_hessian_diag,
     compute_smoothing_weight_only,
 )
+from .smoothrot import detect_ffn_pairs, FFNPair
+from .svd import decompose_weight
 
 
 def _compute_smoothing_for_layer(
@@ -52,14 +54,12 @@ def _compute_smoothing_for_layer(
     """Compute SmoothQuant smoothing factors for a layer.
 
     Same logic as the main-loop SmoothQuant block, but without PermuQuant
-    column reordering (since the permutation hasn't been computed yet).
-    Used by the PiSO pre-pass so that PiSO scales are computed on the
-    smoothed weight.
+    column reordering. Used by the PiSO pre-pass so PiSO scales are
+    computed on the smoothed weight.
 
     Returns:
-        (smoothing_factors, source) — smoothing_factors is [in_features] or
-        None if no valid factors could be computed; source is one of
-        ``"per_channel_amax"``, ``"hessian_diag"``, ``"weight_only"``.
+        (smoothing_factors, source) — [in_features] tensor or None;
+        source is ``"per_channel_amax"``, ``"hessian_diag"``, or ``"weight_only"``.
     """
     layer_name = name_map.get(name)
 
@@ -96,24 +96,17 @@ def _transform_hessian_for_smoothquant(
     hessian: torch.Tensor,
     smoothing_factors: torch.Tensor,
 ) -> torch.Tensor:
-    """Transform Hessian to account for SmoothQuant column scaling.
+    """Transform Hessian for SmoothQuant column scaling.
 
-    After SmoothQuant the effective input to the smoothed weight is
-    ``X̂ = X · diag(1/s)``, so the Hessian becomes::
-
-        Ĥ = X̂ᵀ X̂ = diag(1/s) · H · diag(1/s)
-
-    i.e. ``Ĥ[i,j] = H[i,j] / (s[i] · s[j])``.
-
-    For block-diagonal Hessians each block is transformed with the
-    corresponding slice of *s*.
+    After SmoothQuant, Ĥ = diag(1/s) · H · diag(1/s), i.e. Ĥ[i,j] = H[i,j] / (s[i]·s[j]).
+    For block-diagonal Hessians, each block is transformed with its slice of *s*.
 
     Args:
-        hessian: 2-D ``[in, in]`` or 3-D ``[blocks, bs, bs]`` Hessian.
-        smoothing_factors: ``[in_features]`` per-channel smoothing factors.
+        hessian: 2-D [in, in] or 3-D [blocks, bs, bs] Hessian.
+        smoothing_factors: [in_features] per-channel smoothing factors.
 
     Returns:
-        Transformed Hessian (same shape and dtype as input).
+        Transformed Hessian (same shape and dtype).
     """
     s = smoothing_factors.float()
     orig_dtype = hessian.dtype
@@ -138,16 +131,6 @@ def _transform_hessian_for_smoothquant(
         return H_out.to(orig_dtype)
 
     return hessian
-
-
-DEFAULT_SKIP_PATTERNS = [
-    "embed",
-    "norm",
-    "modulation",
-    "lm_head",
-    "output",
-    "proj_out",
-]
 
 
 def should_skip(name: str, skip_patterns: list[str]) -> bool:
@@ -189,9 +172,13 @@ def quantize_model(
     if config.quant_method == "gptq" and not config.calibration_path:
         raise ValueError("GPTQ requires --calibration path to a .pt file")
 
-    if config.quant_method == "ldlq" and config.calibration_path:
+    if config.quant_method == "ldlq" and not config.calibration_path:
         import warnings
-        warnings.warn("LDLQ does not use calibration data; --calibration path will be ignored")
+        warnings.warn(
+            "LDLQ: no calibration data provided; will fall back to "
+            "H = W^T W / M (weight-only). This can perform worse than RTN. "
+            "Pass --calibration for best results.",
+        )
 
     if config.rot_size > 0 and not _is_power_of_two(config.rot_size):
         raise ValueError(f"rot_size must be 0 (no rotation) or a power of 2, got {config.rot_size}")
@@ -212,6 +199,35 @@ def quantize_model(
             "Consider using --int-bits 8 with --smoothquant."
         )
 
+    # SmoothRot W4 safeguard: auto-disable SmoothRot for INT4 unless overridden.
+    # At W4, the per-channel dynamic range of the smoothed weight can exceed
+    # INT4's 16-level representable range, degrading quality.
+    if config.smoothrot and config.int_bits == 4 and not config.force_smoothrot_w4:
+        logger.warning(
+            "SmoothRot is designed for W8A8 quantization. At W4 (INT4), "
+            "the per-channel dynamic range of the smoothed weight can exceed "
+            "INT4's 16-level representable range, DEGRADING quality. "
+            "SmoothRot is automatically disabled. Use --force-smoothrot-w4 "
+            "to override (not recommended)."
+        )
+        config.smoothrot = False
+
+    # When smoothquant + rot_size > 0, automatically use smooth-then-rotate
+    # order (the correct order per the SmoothRot paper).
+    if config.smoothquant and config.rot_size > 0:
+        config.smoothrot = True
+
+    if config.smoothrot:
+        if config.rot_size == 0:
+            raise ValueError("SmoothRot requires rot_size > 0")
+        if not config.smoothquant:
+            config.smoothquant = True
+
+    if config.svd_rank < 0:
+        raise ValueError(f"svd_rank must be >= 0, got {config.svd_rank}")
+    if config.svd_rank > 0:
+        logger.info("SVD-absorbed enabled: rank=%d", config.svd_rank)
+
     is_int8 = config.int_bits == 8
 
     # Seed CPU (Mersenne Twister) and CUDA (Philox) RNGs for reproducibility.
@@ -231,7 +247,7 @@ def quantize_model(
     # Load calibration data if GPTQ (or SmoothQuant needs it)
     calibration = None
     name_map = {}
-    needs_calibration = config.quant_method == "gptq" or config.smoothquant
+    needs_calibration = config.quant_method in ("gptq", "ldlq") or config.smoothquant
     if needs_calibration and config.calibration_path:
         logger.info("Loading calibration from %s...", config.calibration_path)
         calibration = load_calibration(config.calibration_path)
@@ -305,6 +321,61 @@ def quantize_model(
         logger.info("PiSO: computed optimal scales for %d/%d layers in %.1fs",
                      piso_count, len(piso_eligible), piso_total)
 
+    # ── SmoothRot: detect FFN pairs and precompute smoothing factors ──
+    smoothrot_pairs: dict[str, FFNPair] = {}
+    smoothrot_factors: dict[str, torch.Tensor] = {}
+    smoothrot_alpha = config.smoothrot_alpha if config.smoothrot_alpha is not None else config.smooth_alpha
+    if config.smoothrot:
+        smoothrot_pairs = detect_ffn_pairs(state_dict)
+        for down_name, pair in smoothrot_pairs.items():
+            layer_name = name_map.get(down_name) if name_map else None
+            W_down = state_dict[down_name].float()
+            orig_in = W_down.shape[1]
+
+            # Compute smoothing factors from activation statistics
+            act_amax = None
+            if layer_name is not None and calibration is not None:
+                act_amax = get_per_channel_amax(calibration, layer_name, orig_in)
+
+            if act_amax is not None:
+                if act_amax.shape[0] < W_down.shape[1]:
+                    act_amax = torch.nn.functional.pad(
+                        act_amax, (0, W_down.shape[1] - act_amax.shape[0])
+                    )
+                s = compute_smoothing_factors(act_amax, W_down, alpha=smoothrot_alpha)
+                smoothrot_factors[down_name] = s
+                logger.debug("SmoothRot: %s smoothing from per_channel_amax (alpha=%.2f)",
+                             down_name, smoothrot_alpha)
+            elif calibration is not None and layer_name is not None:
+                h_diag = get_hessian_diag(calibration, layer_name, W_down.shape[1])
+                if h_diag is not None:
+                    if h_diag.shape[0] < W_down.shape[1]:
+                        h_diag = torch.nn.functional.pad(
+                            h_diag, (0, W_down.shape[1] - h_diag.shape[0])
+                        )
+                    n_samples = calibration.get("metadata", {}).get("num_samples", 128)
+                    s = compute_smoothing_from_hessian_diag(
+                        h_diag, W_down, alpha=smoothrot_alpha,
+                        num_calibration_samples=n_samples,
+                    )
+                    smoothrot_factors[down_name] = s
+                    logger.debug("SmoothRot: %s smoothing from hessian_diag (alpha=%.2f)",
+                                 down_name, smoothrot_alpha)
+                else:
+                    # No Hessian diagonal available — skip SmoothRot for this layer.
+                    # Weight-only smoothing without calibration data amplifies
+                    # quantization error at inference (1/s compensation hurts
+                    # more than the smoothing helps).  Plain ConvRot is better.
+                    logger.debug("SmoothRot: %s skipped (no hessian_diag, "
+                                 "weight-only smoothing is harmful)", down_name)
+            else:
+                # No calibration data at all — skip SmoothRot entirely.
+                # Weight-only smoothing is harmful without activation statistics.
+                logger.debug("SmoothRot: %s skipped (no calibration data)", down_name)
+
+        logger.info("SmoothRot: precomputed smoothing factors for %d FFN pairs (alpha=%.2f)",
+                     len(smoothrot_factors), smoothrot_alpha)
+
     output_dict = {}
     meta_prefix = "int_crush"
     method_base = "int_crush_permuq" if config.use_permuquant else "int_crush"
@@ -366,6 +437,14 @@ def quantize_model(
     if config.smoothquant:
         metadata["int_crush.smoothquant"] = "true"
         metadata["int_crush.smooth_alpha"] = str(config.smooth_alpha)
+    if config.smoothrot:
+        metadata["int_crush.smoothrot"] = "true"
+        metadata["int_crush.smoothrot_alpha"] = str(smoothrot_alpha)
+        metadata["int_crush.smoothrot_transform_order"] = "smooth_then_rotate"
+        metadata["int_crush.smoothrot_pairs"] = str(len(smoothrot_pairs))
+    if config.svd_rank > 0:
+        metadata["int_crush.svd_absorbed"] = "true"
+        metadata["int_crush.svd_rank"] = str(config.svd_rank)
 
     skipped = 0
     quantized = 0
@@ -374,6 +453,7 @@ def quantize_model(
     rtn_fallback = 0
     piso_count = 0
     smoothquant_count = 0
+    svd_count = 0
     rot_size_mismatch_warned = False
     layer_reports: list[dict] = []
 
@@ -405,7 +485,7 @@ def quantize_model(
         W = tensor.float()
         orig_in_features = W.shape[1]
 
-        # 0.5 Sanitize outlier weights before rotation/quantization.
+        # 0.5 Sanitize outlier weights (corrupted data) before rotation/quantization.
         outlier_count = 0
         if WEIGHT_OUTLIER_CLAMP > 0:
             outlier_mask = W.abs() > WEIGHT_OUTLIER_CLAMP
@@ -417,21 +497,39 @@ def quantize_model(
                     outlier_count, name, WEIGHT_OUTLIER_CLAMP,
                 )
 
-        # 1. Rotate weights (skip if rot_size == 0)
-        #    Clone only when the downstream path mutates W_work in-place:
-        #    GPTQ/LDLQ always do, and PermuQuant reorders columns.
-        #    RTN with rot_size=0 and no PermuQuant only reads W_work.
-        if config.rot_size > 0:
+        # 0.7 SVD-absorbed: decompose W into low-rank FP16 + quantizable residual.
+        svd_result = None
+        if config.svd_rank > 0:
+            svd_result = decompose_weight(W, rank=config.svd_rank)
+            W = svd_result.residual  # downstream pipeline quantizes this
+            svd_count += 1
+            logger.debug("SVD: rank=%d for %s, residual norm=%.4f",
+                         svd_result.L1.shape[1], name,
+                         svd_result.residual.norm().item())
+
+        # 1. Rotate weights (skip if rot_size == 0).
+        #    Clone only when downstream mutates W_work in-place (GPTQ/LDLQ,
+        #    PermuQuant). RTN with rot_size=0 and no PermuQuant is read-only.
+        #
+        #    SmoothRot: smooth FIRST (diag(s) @ W), rotate SECOND (W_smooth @ R^T).
+        #    Correct order per SmoothRot paper — smoothing tames outliers before Hadamard.
+        is_smoothrot_down = name in smoothrot_factors
+        if is_smoothrot_down:
+            # SmoothRot: smooth first, then rotate
+            s = smoothrot_factors[name]
+            W_smooth = apply_smoothing_to_weight(W, s)
+            W_work = rotate_weights(W_smooth, config.rot_size)
+            logger.debug("SmoothRot: smooth-then-rotate for %s", name)
+        elif config.rot_size > 0:
             W_work = rotate_weights(W, config.rot_size)
         elif config.quant_method in ("gptq", "ldlq") or config.use_permuquant:
             W_work = W.clone()
         else:
             W_work = W  # RTN, no rotation, no PermuQuant — read-only
 
-        # 2. PermuQuant: apply channel reordering
-        #    If calibration provides a permutation (from ComfyUI-GPTQ-Calibration),
-        #    use it directly — the Hessians are already in permuted space.
-        #    Otherwise, compute our own from weight statistics.
+        # 2. PermuQuant: channel reordering.
+        #    If calibration provides a permutation (already in Hessians), use it directly.
+        #    Otherwise, compute from weight statistics.
         perm_applied = False
         perm_orig = None
         cal_perm = None
@@ -474,10 +572,24 @@ def quantize_model(
                 else:
                     logger.debug("PermuQuant skipped (no improvement)")
 
-        # 2.5 SmoothQuant: per-channel smoothing
+        # 2.5 SmoothQuant: per-channel smoothing.
+        #    Skip for SmoothRot down-projections — already applied in step 1.
+        #    Stored as {name}_smoothrot_factors for inference-side 1/s.
         smoothing_applied = False
         smoothing_factors = None
-        if config.smoothquant:
+        smooth_source = None
+        if is_smoothrot_down:
+            # SmoothRot: smoothing already applied in step 1.
+            # Store factors for inference-side 1/s application.
+            smoothing_factors = smoothrot_factors[name]
+            smoothing_applied = True
+            smoothquant_count += 1
+            smooth_source = "smoothrot"
+        elif config.smoothquant and not config.smoothrot:
+            # Old SmoothQuant path: only when SmoothRot is NOT active.
+            # When --smoothrot is used, only FFN down-projections get smoothing.
+            # Non-SmoothRot layers skip smoothing — weight-only smoothing on
+            # rotated weights can amplify quantization error via inference-side 1/s.
             layer_name = name_map.get(name) if name_map else None
 
             # Determine activation statistics source
@@ -556,10 +668,8 @@ def quantize_model(
                 already_rotated = calibration.get("metadata", {}).get("hessian_rotated", False)
                 cal_rot_size = calibration.get("metadata", {}).get("rot_size", 0)
 
-                # If the calibration was rotated with a different rot_size
-                # than the converter is using, the Hessian is in the wrong
-                # space.  We can't re-rotate from the original space, but
-                # we should warn the user.
+                # If calibration was rotated with a different rot_size,
+                # the Hessian is in the wrong space. Warn the user.
                 if already_rotated and cal_rot_size and int(cal_rot_size) != config.rot_size:
                     if not rot_size_mismatch_warned:
                         logger.warning("Calibration rot_size=%s != converter rot_size=%d. "
@@ -597,14 +707,29 @@ def quantize_model(
                             name, hessian.dim(), hessian.shape,
                         )
 
-                # Transform Hessian for SmoothQuant.
-                # After smoothing, the effective input is X̂ = X·diag(1/s),
-                # so Ĥ = diag(1/s)·H·diag(1/s) = H[i,j] / (s[i]·s[j]).
+                # Transform Hessian for SmoothQuant/SmoothRot.
+                #
+                # SmoothRot path: Ĥ = R^T @ diag(1/s) @ H @ diag(1/s) @ R.
+                #   → smooth Hessian first, then rotate.
+                # Standalone SmoothQuant: Ĥ = diag(1/s) @ R^T @ H @ R @ diag(1/s).
+                #   → rotate Hessian first (already done), then smooth.
+                # Both produce H[i,j]/(s[i]·s[j]) but SmoothRot must compose
+                # transforms in the correct mathematical order.
                 if smoothing_applied and smoothing_factors is not None:
-                    hessian = _transform_hessian_for_smoothquant(
-                        hessian, smoothing_factors
-                    )
-                    logger.debug("SmoothQuant: transformed Hessian for %s", name)
+                    if is_smoothrot_down:
+                        # SmoothRot: smooth first, then rotate
+                        hessian = _transform_hessian_for_smoothquant(
+                            hessian, smoothing_factors
+                        )
+                        if not already_rotated and config.rot_size > 0:
+                            hessian = rotate_hessian(hessian, config.rot_size)
+                        logger.debug("SmoothRot: smooth-then-rotate Hessian for %s", name)
+                    else:
+                        # Standalone: rotate first (already done above), then smooth
+                        hessian = _transform_hessian_for_smoothquant(
+                            hessian, smoothing_factors
+                        )
+                        logger.debug("SmoothQuant: transformed Hessian for %s", name)
 
                 # Quantize full rotated weight; zero-energy padded columns handled by damping.
                 result = gptq_quantize_layer(
@@ -633,12 +758,68 @@ def quantize_model(
                 rtn_fallback += 1
                 logger.debug("No calibration data, using RTN fallback")
         elif config.quant_method == "ldlq":
-            # LDLQ: weight-only quantization using H = W^T @ W (no calibration needed).
-            # Quantize the full padded weight so LDLQ's internal Hessian
-            # (computed from the same padded W) stays consistent; the
-            # zero-energy padding columns are damped away naturally.
+            # LDLQ: adaptive rounding using the same Hessian as GPTQ.
+            # When calibration data is available, uses H = E_x[xx^T].  Without calibration,
+            # falls back to H = W^T W / M (weight-only, worse than RTN).
+            layer_name = name_map.get(name) if name_map else None
+            ldlq_hessian = None
+            if layer_name is not None and calibration is not None:
+                ldlq_hessian = get_hessian(calibration, layer_name, tensor.shape)
+
+            if ldlq_hessian is not None:
+                already_rotated = calibration.get("metadata", {}).get("hessian_rotated", False)
+                cal_rot_size = calibration.get("metadata", {}).get("rot_size", 0)
+
+                if already_rotated and cal_rot_size and int(cal_rot_size) != config.rot_size:
+                    if not rot_size_mismatch_warned:
+                        logger.warning(
+                            "Calibration rot_size=%s != converter rot_size=%d. "
+                            "Hessian is in the wrong rotation space.",
+                            cal_rot_size, config.rot_size,
+                        )
+                        rot_size_mismatch_warned = True
+
+                # Rotate Hessian if needed
+                if not already_rotated and config.rot_size > 0:
+                    ldlq_hessian = rotate_hessian(ldlq_hessian, config.rot_size)
+
+                # Re-permute for self-computed permutations
+                if perm_applied and cal_perm is None:
+                    if ldlq_hessian.dim() == 2:
+                        ldlq_hessian = ldlq_hessian[perm_orig][:, perm_orig]
+                    else:
+                        inv_perm = perm_orig.argsort()
+                        orig_features = min(orig_in_features, inv_perm.shape[0])
+                        W_orig = W_work[:, :orig_features]
+                        W_work[:, :orig_features] = W_orig[:, inv_perm]
+                        if smoothing_applied and smoothing_factors is not None:
+                            s_orig = smoothing_factors[:orig_features].clone()
+                            smoothing_factors[:orig_features] = s_orig[inv_perm]
+                        perm_applied = False
+                        logger.debug(
+                            "PermuQuant: un-permuted W_work for block-diagonal Hessian "
+                            "for %s (%dD, shape %s)",
+                            name, ldlq_hessian.dim(), ldlq_hessian.shape,
+                        )
+
+                # Transform Hessian for SmoothQuant/SmoothRot
+                if smoothing_applied and smoothing_factors is not None:
+                    if is_smoothrot_down:
+                        ldlq_hessian = _transform_hessian_for_smoothquant(
+                            ldlq_hessian, smoothing_factors
+                        )
+                        if not already_rotated and config.rot_size > 0:
+                            ldlq_hessian = rotate_hessian(ldlq_hessian, config.rot_size)
+                        logger.debug("SmoothRot: smooth-then-rotate Hessian for %s (LDLQ)", name)
+                    else:
+                        ldlq_hessian = _transform_hessian_for_smoothquant(
+                            ldlq_hessian, smoothing_factors
+                        )
+                        logger.debug("SmoothQuant: transformed Hessian for %s (LDLQ)", name)
+
             result = ldlq_quantize_layer(
                 W_work,
+                hessian=ldlq_hessian,
                 block_size=config.gptq_block_size,
                 damping=config.damping,
                 int_bits=config.int_bits,
@@ -679,17 +860,14 @@ def quantize_model(
                     scales = calculate_scales(W_work, in_features, clipping_ratios=config.clipping_ratios)
                     quantized_W = quantize_weights(W_work, scales, in_features)
 
-        # 4. Pack (INT4 only) or store directly (INT8)
+        # 4. Pack (INT4) or store directly (INT8)
         if is_int8:
             stored_weights = quantized_W
         else:
             stored_weights = pack_int4(quantized_W)
 
-        # 5. Verify: dequantize and compare to working weights
-        #    Compute diff once to avoid materialising (W_work - dequant) twice
-        #    and free intermediates eagerly to reduce peak memory.
-        #    Use non-in-place subtraction because W_work may alias W
-        #    (optimisation: skip clone for RTN with rot_size=0).
+        # 5. Verify: dequantize and compare to working weights.
+        #    Use float64 for MSE to prevent overflow when scales are very large.
         if zero_points is not None:
             dequant = (quantized_W.float() - zero_points.float()) * scales.float()
         else:
@@ -766,7 +944,9 @@ def quantize_model(
                 "fallbacks": layer_fallbacks,
                 "shape": list(tensor.shape),
                 "smoothquant": smoothing_applied,
+                "smoothrot": is_smoothrot_down,
                 "smooth_source": smooth_source if smoothing_applied else None,
+                "svd_rank": svd_result.L1.shape[1] if svd_result is not None else 0,
             })
 
         # Store weights and scales
@@ -775,21 +955,39 @@ def quantize_model(
         if zero_points is not None:
             output_dict[f"{name}_zp"] = zero_points
 
+        # Store SVD low-rank factors for inference
+        if svd_result is not None:
+            output_dict[f"{name}_L1"] = svd_result.L1  # [out, r] FP16
+            output_dict[f"{name}_L2"] = svd_result.L2  # [r, in]  FP16
+
         # Store smoothing factors for inference-side inverse absorption
-        if smoothing_applied and smoothing_factors is not None:
+        if is_smoothrot_down and smoothing_factors is not None:
+            # SmoothRot: store as smoothrot_factors for inference-side 1/s
+            # (applied BEFORE the online Hadamard, not after).
+            output_dict[f"{name}_smoothrot_factors"] = smoothing_factors[:orig_in_features].to(SMOOTH_FACTOR_DTYPE)
+        elif smoothing_applied and smoothing_factors is not None:
+            # Standalone SmoothQuant: store as {name}_smooth
             # Store only the original (unpadded) portion
             output_dict[f"{name}_smooth"] = smoothing_factors[:orig_in_features].to(SMOOTH_FACTOR_DTYPE)
 
         # ComfyUI-INT8-Fast compatibility: write comfy_quant metadata tensor
         if config.comfy_compat and config.rot_size > 0 and is_int8:
             layer_prefix = name.rsplit(".weight", 1)[0]
-            comfy_quant = json.dumps({
+            comfy_quant_data = {
                 "convrot": True,
                 "convrot_groupsize": config.rot_size,
                 "per_row": True,
-                "smoothquant": config.smoothquant,
-                "smooth_alpha": config.smooth_alpha if config.smoothquant else None,
-            }).encode("utf-8")
+                "smoothquant": config.smoothquant and not is_smoothrot_down,
+                "smooth_alpha": config.smooth_alpha if (config.smoothquant and not is_smoothrot_down) else None,
+            }
+            if is_smoothrot_down:
+                comfy_quant_data["smoothrot"] = True
+                comfy_quant_data["smoothrot_transform_order"] = "smooth_then_rotate"
+                comfy_quant_data["smooth_alpha"] = smoothrot_alpha
+            if svd_result is not None:
+                comfy_quant_data["svd_absorbed"] = True
+                comfy_quant_data["svd_rank"] = svd_result.L1.shape[1]
+            comfy_quant = json.dumps(comfy_quant_data).encode("utf-8")
             output_dict[f"{layer_prefix}.comfy_quant"] = torch.tensor(
                 list(comfy_quant), dtype=torch.uint8
             )
@@ -825,6 +1023,9 @@ def quantize_model(
             if bias_key in state_dict:
                 output_dict[bias_key] = state_dict[bias_key]
 
+    # Ensure all tensors are contiguous (SVD-absorbed splits can be non-contiguous views)
+    output_dict = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in output_dict.items()}
+
     # Save
     output_path = os.path.join(config.output_dir, "model.safetensors")
     logger.info("Saving to %s...", output_path)
@@ -843,8 +1044,12 @@ def quantize_model(
         logger.info("PermuQuant applied to %d/%d layers", permuted, quantized)
     if config.smoothquant:
         logger.info("SmoothQuant applied to %d/%d layers (alpha=%.2f)", smoothquant_count, quantized, config.smooth_alpha)
+    if config.smoothrot and smoothrot_factors:
+        logger.info("SmoothRot: %d FFN pairs processed (alpha=%.2f)", len(smoothrot_factors), smoothrot_alpha)
     if config.piso_scales and piso_scales_dict:
         logger.info("PiSO: optimal scales computed for %d layers", len(piso_scales_dict))
+    if config.svd_rank > 0:
+        logger.info("SVD-absorbed: %d/%d layers decomposed (rank=%d)", svd_count, quantized, config.svd_rank)
     if config.quant_method in ("gptq", "ldlq"):
         logger.info("%s: %d layers, RTN fallback: %d layers", config.quant_method.upper(), gptq_count, rtn_fallback)
     logger.info("Input size: %.2f GB", input_size)
@@ -860,6 +1065,7 @@ def quantize_model(
             gptq_layers=gptq_count,
             rtn_fallback_layers=rtn_fallback,
             smoothquant_layers=smoothquant_count,
+            svd_layers=svd_count,
             elapsed_seconds=total_elapsed,
             input_size_gb=round(input_size, 2),
             output_size_gb=round(output_size, 2),

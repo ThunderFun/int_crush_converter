@@ -1,7 +1,10 @@
-"""Tests for quant.scales — per-row scale calculation."""
+"""Tests for quant.scales — per-row scale calculation and scale clipping."""
 
+import pytest
 import torch
 
+from converter.config import FP16_SCALE_FLOOR, MAX_FP16_SCALE, INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
+from converter.gptq import gptq_quantize_layer, gptq_quantize_layer_rtn
 from converter.scales import (
     _search_clipping_ratio,
     calculate_scales,
@@ -13,6 +16,11 @@ from converter.scales import (
     calculate_scales_int8_asymmetric,
     quantize_weights_int8_asymmetric,
 )
+
+
+def _all_finite_fp16(t: torch.Tensor) -> bool:
+    """Return True if tensor is float16 with no Inf/NaN."""
+    return t.dtype == torch.float16 and t.isfinite().all().item()
 
 
 class TestCalculateScales:
@@ -351,3 +359,219 @@ class TestSearchClippingRatio:
         mse3 = (W.unsqueeze(1) - q3 * scales_3.unsqueeze(2)).pow(2).mean()
 
         assert mse3 <= mse1 + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Scale clipping — extreme weights and clipping ratios
+# ---------------------------------------------------------------------------
+
+
+class TestCalculateScalesClipping:
+    """INT4 symmetric: calculate_scales() with clipping ratios and extreme weights."""
+
+    def test_normal_weights_no_inf(self):
+        torch.manual_seed(0)
+        W = torch.randn(32, 128)
+        scales = calculate_scales(W)
+        assert _all_finite_fp16(scales)
+        assert scales.min() > 0
+
+    def test_extreme_weights_clamped(self):
+        W = torch.full((4, 64), 1e8)
+        scales = calculate_scales(W)
+        assert _all_finite_fp16(scales)
+        assert scales.max() <= MAX_FP16_SCALE
+
+    def test_mixed_extreme_rows(self):
+        W = torch.randn(8, 64)
+        W[3] = 1e10
+        scales = calculate_scales(W)
+        assert _all_finite_fp16(scales)
+        assert scales[0] < 1.0
+        assert scales[3] <= MAX_FP16_SCALE
+
+    def test_clipping_ratios_with_extreme_weights(self):
+        W = torch.full((4, 64), 1e8)
+        scales = calculate_scales(W, clipping_ratios=[0.8, 0.9, 1.0])
+        assert _all_finite_fp16(scales)
+        assert scales.max() <= MAX_FP16_SCALE
+
+    def test_fp16_roundtrip_never_inf(self):
+        W = torch.randn(16, 64) * 1000
+        scales = calculate_scales(W)
+        roundtripped = scales.float()
+        assert roundtripped.isfinite().all()
+
+    def test_zero_weight_still_works(self):
+        W = torch.zeros(4, 32)
+        scales = calculate_scales(W)
+        assert _all_finite_fp16(scales)
+        assert scales.min() > 0
+
+    def test_quantize_with_clamped_scales(self):
+        W = torch.randn(8, 64) * 100
+        scales = calculate_scales(W)
+        q = quantize_weights(W, scales)
+        assert q.min() >= -8
+        assert q.max() <= 7
+
+
+class TestCalculateScalesInt8Clipping:
+    """INT8 symmetric: calculate_scales_int8() with extreme weights."""
+
+    def test_normal_weights_no_inf(self):
+        W = torch.randn(32, 128)
+        scales = calculate_scales_int8(W)
+        assert _all_finite_fp16(scales)
+
+    def test_extreme_weights_clamped(self):
+        W = torch.full((4, 64), 1e8)
+        scales = calculate_scales_int8(W)
+        assert _all_finite_fp16(scales)
+        assert scales.max() <= MAX_FP16_SCALE
+
+    def test_clipping_ratios_extreme(self):
+        W = torch.full((4, 64), 1e10)
+        scales = calculate_scales_int8(W, clipping_ratios=[0.85, 0.9, 1.0])
+        assert _all_finite_fp16(scales)
+
+    def test_quantize_with_clamped_scales(self):
+        W = torch.randn(16, 64) * 1000
+        scales = calculate_scales_int8(W)
+        q = quantize_weights_int8(W, scales)
+        assert q.min() >= -128
+        assert q.max() <= 127
+
+    def test_fp16_roundtrip(self):
+        W = torch.randn(16, 64) * 500
+        scales = calculate_scales_int8(W)
+        assert scales.float().isfinite().all()
+
+
+class TestCalculateScalesAsymmetricClipping:
+    """INT4 asymmetric: calculate_scales_asymmetric() with extreme weights."""
+
+    def test_normal_weights_no_inf(self):
+        W = torch.randn(16, 64)
+        scales, zps = calculate_scales_asymmetric(W)
+        assert _all_finite_fp16(scales)
+
+    def test_extreme_weights_clamped(self):
+        W = torch.full((4, 64), 1e8)
+        scales, zps = calculate_scales_asymmetric(W)
+        assert _all_finite_fp16(scales)
+        assert scales.max() <= MAX_FP16_SCALE
+
+    def test_clipping_ratios_extreme(self):
+        W = torch.randn(8, 64) * 1e6
+        scales, zps = calculate_scales_asymmetric(W, clipping_ratios=[0.9, 1.0])
+        assert _all_finite_fp16(scales)
+
+    def test_quantize_with_clamped_scales(self):
+        W = torch.randn(8, 64) * 100
+        scales, zps = calculate_scales_asymmetric(W)
+        q = quantize_weights_asymmetric(W, scales, zps)
+        assert q.min() >= -8
+        assert q.max() <= 7
+
+
+class TestCalculateScalesInt8AsymmetricClipping:
+    """INT8 asymmetric: calculate_scales_int8_asymmetric() with extreme weights."""
+
+    def test_normal_weights_no_inf(self):
+        W = torch.randn(16, 64)
+        scales, zps = calculate_scales_int8_asymmetric(W)
+        assert _all_finite_fp16(scales)
+
+    def test_extreme_weights_clamped(self):
+        W = torch.full((4, 64), 1e8)
+        scales, zps = calculate_scales_int8_asymmetric(W)
+        assert _all_finite_fp16(scales)
+        assert scales.max() <= MAX_FP16_SCALE
+
+    def test_clipping_ratios_extreme(self):
+        W = torch.randn(8, 64) * 1e6
+        scales, zps = calculate_scales_int8_asymmetric(W, clipping_ratios=[0.9, 1.0])
+        assert _all_finite_fp16(scales)
+
+
+# ---------------------------------------------------------------------------
+# Scale validation fallback (simulates CLI behavior)
+# ---------------------------------------------------------------------------
+
+
+class TestScaleValidationFallback:
+    """Verify that the CLI's validation + recompute fallback works."""
+
+    @staticmethod
+    def _simulate_validation(W_work, scales, int_bits=8):
+        divisor = INT8_SCALE_DIVISOR if int_bits == 8 else INT4_SCALE_DIVISOR
+        bad = scales.isinf() | scales.isnan() | (scales == 0)
+        if bad.any():
+            fix = (W_work.float().abs().amax(dim=1, keepdim=True) / divisor
+                   ).clamp(min=FP16_SCALE_FLOOR, max=MAX_FP16_SCALE).to(torch.float16)
+            scales = torch.where(bad, fix, scales)
+        return scales
+
+    def test_inf_scale_replaced(self):
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
+        scales = torch.tensor([[0.001], [float('inf')], [0.002], [0.003]],
+                              dtype=torch.float16)
+        fixed = self._simulate_validation(W_work, scales)
+        assert _all_finite_fp16(fixed)
+        assert fixed[0] == scales[0]
+        assert fixed[1] != float('inf')
+
+    def test_nan_scale_replaced(self):
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
+        scales = torch.tensor([[0.001], [float('nan')], [0.002], [0.003]],
+                              dtype=torch.float16)
+        fixed = self._simulate_validation(W_work, scales)
+        assert _all_finite_fp16(fixed)
+
+    def test_zero_scale_replaced(self):
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
+        scales = torch.tensor([[0.001], [0.0], [0.002], [0.003]],
+                              dtype=torch.float16)
+        fixed = self._simulate_validation(W_work, scales)
+        assert _all_finite_fp16(fixed)
+        assert fixed[1] > 0
+
+    def test_all_good_scales_unchanged(self):
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
+        scales = torch.tensor([[0.001], [0.002], [0.003], [0.004]],
+                              dtype=torch.float16)
+        fixed = self._simulate_validation(W_work, scales)
+        assert torch.equal(fixed, scales)
+
+    def test_multiple_bad_scales(self):
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
+        scales = torch.tensor([[float('inf')], [float('nan')], [0.0], [0.003]],
+                              dtype=torch.float16)
+        fixed = self._simulate_validation(W_work, scales)
+        assert _all_finite_fp16(fixed)
+        assert fixed[3] == scales[3]
+
+    def test_int4_repair_scale_magnitude(self):
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 30.0
+        scales = torch.tensor([[float('inf')], [1.0], [0.0], [0.5]], dtype=torch.float16)
+        fixed = self._simulate_validation(W_work, scales, int_bits=4)
+        assert fixed[0].item() > 2.0
+        assert fixed[2].item() > 2.0
+        assert fixed[1].item() == 1.0
+        assert fixed[3].item() == 0.5
+
+    def test_int8_repair_scale_magnitude(self):
+        torch.manual_seed(0)
+        W_work = torch.randn(4, 64) * 500.0
+        scales = torch.tensor([[float('inf')], [1.0], [0.0], [0.5]], dtype=torch.float16)
+        fixed = self._simulate_validation(W_work, scales, int_bits=8)
+        assert fixed[0].item() > 2.0
+        assert fixed[1].item() == 1.0
+        assert fixed[3].item() == 0.5

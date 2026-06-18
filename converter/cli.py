@@ -201,10 +201,24 @@ def main() -> None:
                         help="SmoothQuant migration strength (default: 0.5). "
                              "0.0 = all difficulty to weights, 1.0 = all to activations. "
                              "0.5 works for most models; use 0.75 for severe outliers.")
+    parser.add_argument("--smoothrot", action="store_true",
+                        help="Explicit confirmation of smooth-then-rotate order (now the default "
+                             "when --smoothquant + --rot-size > 0). Also enables FFN pair detection "
+                             "and smoothrot_factors storage.")
+    parser.add_argument("--smoothrot-alpha", type=float, default=None,
+                        help="SmoothRot migration strength (default: inherits --smooth-alpha). "
+                             "The SmoothRot paper recommends 0.45-0.6 for LLaMA-family models.")
+    parser.add_argument("--force-smoothrot-w4", action="store_true",
+                        help="Force smooth-then-rotate for W4 despite quality risk (not recommended)")
     parser.add_argument("--no-progress", action="store_true", default=False,
                         help="Disable per-layer progress with ETA (default: progress is on)")
     parser.add_argument("--seed", type=int, default=42, metavar="N",
                         help="Random seed for reproducible output (default: 42, -1 to disable)")
+    parser.add_argument("--svd-rank", type=int, default=0, metavar="R",
+                        help="SVD-absorbed low-rank rank (0=disabled, default: 0). "
+                             "16 for INT8, 32 for INT4. Decomposes each weight as "
+                             "W ≈ L1@L2 + residual; L1/L2 stored in FP16, "
+                             "residual quantized normally.")
 
     args = parser.parse_args()
 
@@ -219,6 +233,22 @@ def main() -> None:
 
     if args.rot_size != 0 and (args.rot_size & (args.rot_size - 1)) != 0:
         parser.error(f"--rot-size must be 0 or a power of 2, got {args.rot_size}")
+
+    # SmoothRot validation: auto-enable smooth-then-rotate when both
+    # --smoothquant and --rot-size > 0 are active (correct pipeline order).
+    if args.smoothquant and args.rot_size > 0:
+        args.smoothrot = True  # auto-enable for correct pipeline order
+    if args.smoothrot:
+        if args.rot_size == 0:
+            parser.error("--smoothrot requires --rot-size > 0")
+        if not args.smoothquant:
+            args.smoothquant = True  # auto-enable smoothquant
+        if args.int_bits == 4 and not args.force_smoothrot_w4:
+            logger.warning(
+                "Smooth-then-rotate at W4 (INT4) can hurt quality due to limited "
+                "dynamic range. The old rotate-then-smooth was even worse. "
+                "Consider --int-bits 8. Use --force-smoothrot-w4 to suppress."
+            )
 
     skip_patterns = None
     if args.skip_patterns:
@@ -263,6 +293,10 @@ def main() -> None:
         smooth_alpha=args.smooth_alpha,
         quality_report_path=quality_report_path,
         seed=args.seed,
+        smoothrot=args.smoothrot,
+        smoothrot_alpha=args.smoothrot_alpha,
+        force_smoothrot_w4=args.force_smoothrot_w4,
+        svd_rank=args.svd_rank,
     )
 
     progress_callback = None

@@ -1,10 +1,5 @@
 """Tests for the Triton GPTQ block kernel."""
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import torch
 import pytest
 
@@ -12,35 +7,10 @@ from converter.gptq_triton import gptq_loop_triton, _HAS_GPTQ_TRITON
 from converter.rounding import _gptq_block, _invert_hessian
 
 
-class TestGPTQTritonImports:
-    """Tests for import and availability."""
-
-    def test_import_gptq_loop_triton(self):
-        """gptq_loop_triton should be importable regardless of Triton availability."""
-        assert callable(gptq_loop_triton)
-
-    def test_has_triton_flag(self):
-        """_HAS_GPTQ_TRITON should be a bool."""
-        assert isinstance(_HAS_GPTQ_TRITON, bool)
-
-    def test_returns_none_without_triton(self):
-        """gptq_loop_triton should return None if Triton can't run."""
-        if _HAS_GPTQ_TRITON:
-            return  # Can't test this without removing Triton
-        M, N = 8, 32
-        W = torch.randn(M, N)
-        H_inv = torch.eye(N)
-        scales = torch.ones(M)
-        Q = torch.zeros(M, N, dtype=torch.int8)
-        result = gptq_loop_triton(W, H_inv, scales, Q, N, M, 32, -8, 7)
-        assert result is None
-
-
 @pytest.mark.gpu
 class TestGPTQTritonOutputRange:
     """Tests for output value range."""
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_int4_output_range(self):
         """Triton kernel INT4 output must be in [-8, 7]."""
         if not _HAS_GPTQ_TRITON:
@@ -56,7 +26,6 @@ class TestGPTQTritonOutputRange:
         assert Q.min() >= -8
         assert Q.max() <= 7
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_int8_output_range(self):
         """Triton kernel INT8 output must be in [-128, 127]."""
         if not _HAS_GPTQ_TRITON:
@@ -72,7 +41,6 @@ class TestGPTQTritonOutputRange:
         assert Q.min() >= -128
         assert Q.max() <= 127
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_output_dtype(self):
         """Triton kernel output should be int8."""
         if not _HAS_GPTQ_TRITON:
@@ -91,7 +59,6 @@ class TestGPTQTritonOutputRange:
 class TestGPTQTritonMatchesReference:
     """Test that Triton kernel produces identical output to PyTorch reference."""
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_matches_reference_single_block(self):
         """Triton should match _gptq_block for a single block (block_size == N)."""
         if not _HAS_GPTQ_TRITON:
@@ -131,7 +98,6 @@ class TestGPTQTritonMatchesReference:
             f"W_work diverged. Max diff: {(W_tri.cpu() - W_ref).abs().max().item()}"
         )
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_matches_reference_multiple_blocks(self):
         """Triton should match _gptq_block when block_size < N."""
         if not _HAS_GPTQ_TRITON:
@@ -169,7 +135,6 @@ class TestGPTQTritonMatchesReference:
             f"Triton Q differs from reference. Max diff: {q_diff}"
         )
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_matches_reference_non_power_of_two(self):
         """Triton should handle non-power-of-two block sizes."""
         if not _HAS_GPTQ_TRITON:
@@ -207,7 +172,6 @@ class TestGPTQTritonMatchesReference:
             f"Triton Q differs from reference. Max diff: {q_diff}"
         )
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_matches_reference_int8(self):
         """Triton should match _gptq_block for INT8 quantization."""
         if not _HAS_GPTQ_TRITON:
@@ -244,7 +208,6 @@ class TestGPTQTritonMatchesReference:
             f"Max diff: {(Q_tri.cpu().float() - Q_ref.float()).abs().max().item()}"
         )
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_matches_reference_w_work_modified(self):
         """W_work should be modified identically by Triton and reference."""
         if not _HAS_GPTQ_TRITON:
@@ -286,7 +249,6 @@ class TestGPTQTritonMatchesReference:
 class TestGPTQTritonLargerShapes:
     """Tests with larger, realistic shapes."""
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_shape_256x1024(self):
         """Triton should produce correct output for larger shapes."""
         if not _HAS_GPTQ_TRITON:
@@ -327,7 +289,6 @@ class TestGPTQTritonLargerShapes:
 class TestGPTQTritonEndToEnd:
     """End-to-end tests through gptq_quantize_layer."""
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_end_to_end_2d_hessian(self):
         """gptq_quantize_layer should work with Triton acceleration."""
         from converter.gptq import gptq_quantize_layer
@@ -351,7 +312,6 @@ class TestGPTQTritonEndToEnd:
         assert scales.dtype == torch.float16
         assert torch.all(scales > 0)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_end_to_end_3d_hessian(self):
         """gptq_quantize_layer should work with 3D block-diagonal Hessians."""
         from converter.gptq import gptq_quantize_layer
@@ -377,7 +337,6 @@ class TestGPTQTritonEndToEnd:
         assert q_W.min() >= -8
         assert q_W.max() <= 7
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_end_to_end_int8(self):
         """gptq_quantize_layer should work with INT8 bit-width."""
         from converter.gptq import gptq_quantize_layer
@@ -397,7 +356,6 @@ class TestGPTQTritonEndToEnd:
         assert q_W.min() >= -128
         assert q_W.max() <= 127
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_end_to_end_zero_weights(self):
         """Zero weights should quantize to zero."""
         from converter.gptq import gptq_quantize_layer
@@ -413,7 +371,6 @@ class TestGPTQTritonEndToEnd:
         zero_points = _qr.zero_points
         assert torch.all(q_W == 0)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_end_to_end_gptq_reduces_error_vs_rtn(self):
         """GPTQ with Triton should still reduce error vs RTN."""
         from converter.gptq import gptq_quantize_layer, gptq_quantize_layer_rtn

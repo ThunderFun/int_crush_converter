@@ -1,15 +1,7 @@
-"""SmoothQuant: per-channel activation smoothing for quantization.
+"""SmoothQuant: per-channel activation smoothing (arXiv:2211.10438).
 
-Implements the smoothing transformation from SmoothQuant (arXiv:2211.10438):
-
-    Y = X @ W = (X @ diag(1/s)) @ (diag(s) @ W)
-
-where s_j = max|X_j|^alpha / max|W_j|^(1-alpha) are per-input-channel
-smoothing factors that balance quantization difficulty between activations
-and weights.
-
-At inference, the activation-side inverse scaling (1/s) is absorbed into
-the preceding normalization or linear layer — zero runtime overhead.
+Y = X @ W = (X @ diag(1/s)) @ (diag(s) @ W), where s_j = max|X_j|^alpha / max|W_j|^(1-alpha).
+At inference, 1/s is absorbed into the preceding module — zero runtime overhead.
 """
 
 import torch
