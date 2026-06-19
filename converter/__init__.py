@@ -13,6 +13,15 @@ from .scales import (
     quantize_weights_int8_asymmetric,
 )
 from .config import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
+from .dlr import (
+    is_dlr,
+    validate_dlr,
+    woodbury_inverse,
+    dlr_to_dense,
+    transform_dlr_for_smoothquant,
+    permute_dlr,
+    make_dlr_dict,
+)
 from .gptq import gptq_quantize_layer, gptq_quantize_layer_rtn
 from .ldlq import ldlq_quantize_layer
 from .calibration_io import load_calibration, build_name_map, get_hessian, get_per_channel_amax
@@ -45,6 +54,13 @@ __all__ = [
     "quantize_weights_int8_asymmetric",
     "INT4_SCALE_DIVISOR",
     "INT8_SCALE_DIVISOR",
+    "is_dlr",
+    "validate_dlr",
+    "woodbury_inverse",
+    "dlr_to_dense",
+    "transform_dlr_for_smoothquant",
+    "permute_dlr",
+    "make_dlr_dict",
     "gptq_quantize_layer",
     "gptq_quantize_layer_rtn",
     "ldlq_quantize_layer",

@@ -15,6 +15,9 @@ from safetensors.torch import load_file, save_file
 from .log import logger
 from .types import ProgressCallback, ProgressInfo, ProgressSummary, QuantizeConfig
 from .rotation import rotate_weights, _is_power_of_two, rotate_hessian
+from .dlr import (
+    is_dlr, transform_dlr_for_smoothquant, permute_dlr, make_dlr_dict,
+)
 from .scales import (
     calculate_scales, quantize_weights,
     calculate_scales_int8, quantize_weights_int8,
@@ -93,22 +96,22 @@ def _compute_smoothing_for_layer(
 
 
 def _transform_hessian_for_smoothquant(
-    hessian: torch.Tensor,
+    hessian,
     smoothing_factors: torch.Tensor,
-) -> torch.Tensor:
-    """Transform Hessian for SmoothQuant column scaling.
+):
+    """Transform Hessian for SmoothQuant: ``Ĥ = diag(1/s) H diag(1/s)``.
 
-    After SmoothQuant, Ĥ = diag(1/s) · H · diag(1/s), i.e. Ĥ[i,j] = H[i,j] / (s[i]·s[j]).
-    For block-diagonal Hessians, each block is transformed with its slice of *s*.
-
-    Args:
-        hessian: 2-D [in, in] or 3-D [blocks, bs, bs] Hessian.
-        smoothing_factors: [in_features] per-channel smoothing factors.
-
-    Returns:
-        Transformed Hessian (same shape and dtype).
+    For DLR, transforms factors directly (preserves structure).
     """
     s = smoothing_factors.float()
+
+    # DLR Hessian: transform factors directly (preserves DLR structure).
+    if is_dlr(hessian):
+        D_new, U_new = transform_dlr_for_smoothquant(
+            hessian["D"], hessian["U"], s
+        )
+        return make_dlr_dict(D_new, U_new)
+
     orig_dtype = hessian.dtype
 
     if hessian.dim() == 2:
@@ -685,7 +688,13 @@ def quantize_model(
 
                 # Re-permute only for self-computed permutations.
                 if perm_applied and cal_perm is None:
-                    if hessian.dim() == 2:
+                    if is_dlr(hessian):
+                        # DLR Hessian: permute D and U rows directly.
+                        D_new, U_new = permute_dlr(
+                            hessian["D"], hessian["U"], perm_orig
+                        )
+                        hessian = make_dlr_dict(D_new, U_new)
+                    elif hessian.dim() == 2:
                         hessian = hessian[perm_orig][:, perm_orig]
                     else:
                         # Block-diagonal Hessian cannot be permuted in-place.
@@ -785,7 +794,13 @@ def quantize_model(
 
                 # Re-permute for self-computed permutations
                 if perm_applied and cal_perm is None:
-                    if ldlq_hessian.dim() == 2:
+                    if is_dlr(ldlq_hessian):
+                        # DLR Hessian: permute D and U rows directly.
+                        D_new, U_new = permute_dlr(
+                            ldlq_hessian["D"], ldlq_hessian["U"], perm_orig
+                        )
+                        ldlq_hessian = make_dlr_dict(D_new, U_new)
+                    elif ldlq_hessian.dim() == 2:
                         ldlq_hessian = ldlq_hessian[perm_orig][:, perm_orig]
                     else:
                         inv_perm = perm_orig.argsort()

@@ -32,6 +32,7 @@ python -m converter.cli -i model.safetensors -o ./out --rot-size 256 --int-bits 
 | `-i, --input` | required | Input `.safetensors` |
 | `-o, --output` | required | Output directory |
 | `--rot-size` | `0` | Hadamard group size: `0`/`16`/`64`/`256` |
+| `--svd-rank` | `0` | SVD-absorbed low-rank rank. `0` disables. `16` recommended for INT8, `32` for INT4. Decomposes each weight as `W ≈ L1@L2 + residual`; L1/L2 stored in FP16, residual quantized normally |
 | `--int-bits` | `4` | `4` or `8` |
 | `--perm-group-size` | `128` | PermuQuant acceptance evaluation group size |
 | `--quant-group-size` | `128` | RTN quantization group size. INT4 always uses per-row scales |

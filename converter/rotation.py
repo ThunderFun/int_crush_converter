@@ -153,22 +153,35 @@ def rotate_activations(x: torch.Tensor, rot_size: int) -> torch.Tensor:
     return x_rotated.reshape(*leading_shape, in_features)
 
 
-def rotate_hessian(H: torch.Tensor, rot_size: int) -> torch.Tensor:
+def rotate_hessian(H, rot_size: int):
     """Rotate a Hessian to match rotated weight space: H_rot = R^T @ H @ R.
 
     Since W_rot = W @ R, the Hessian must transform as H_rot = R^T @ H @ R
     so GPTQ's error compensation operates in the correct space.
     R is block-diagonal Hadamard (orthogonal: R^T @ R = I).
 
+    Supports three Hessian formats:
+
+    * **2-D** ``[in, in]`` — full Hessian, rotated directly.
+    * **3-D** ``[num_blocks, bs, bs]`` — block-diagonal, each block rotated.
+    * **DLR dict** ``{"format": "dlr", ...}`` — materialised to dense then
+      rotated (rotation destroys the DLR structure).
+
     Args:
-        H: 2D [in, in] or 3D [num_blocks, bs, bs] Hessian.
+        H: 2D [in, in], 3D [num_blocks, bs, bs], or DLR dict Hessian.
         rot_size: Hadamard block size.
 
     Returns:
-        Hessian in rotated weight space (same shape as input).
+        Hessian in rotated weight space (2D tensor for DLR input,
+        same shape as input for 2D/3D input).
     """
     if not _is_power_of_two(rot_size):
         raise ValueError(f"rot_size must be a power of 2, got {rot_size}")
+
+    # DLR Hessian: materialise to dense, then rotate as 2-D.
+    if isinstance(H, dict) and H.get("format") == "dlr":
+        from .dlr import dlr_to_dense
+        H = dlr_to_dense(H["D"], H["U"])
 
     H = H.float()
 

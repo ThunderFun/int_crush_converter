@@ -7,6 +7,7 @@ quantization error to remaining unquantized columns.
 import os
 import torch
 
+from .dlr import is_dlr, woodbury_inverse
 from .log import logger
 from .scales import (
     calculate_scales, quantize_weights,
@@ -113,13 +114,7 @@ def _prepare_hinv(
     damping: float,
     device: torch.device,
 ) -> torch.Tensor:
-    """Return the true inverse Hessian (no Cholesky decomposition).
-
-    This is the production implementation used by default via
-    ``_gptq_prepare_hessian``.  Unlike the legacy :func:`_prepare_hessian`
-    (which stores only the Cholesky factor), this returns the full H⁻¹
-    so that column extraction is a simple slice rather than a forward-solve.
-    """
+    """Return the full inverse H⁻¹ (production path)."""
     diag_mean = H_block.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
     H_damped = H_block + damping * diag_mean * torch.eye(H_block.shape[0], dtype=torch.float32)
     return _invert_hessian(H_damped).to(device)
@@ -166,9 +161,13 @@ def gptq_quantize_layer(
     [num_blocks, bs, bs]. For block-diagonal, each block is processed
     independently.
 
+    Also supports DLR Hessians (dict with ``"format": "dlr"``) — inverse is
+    computed via Woodbury in ``O(nr²)``, ignoring ``hessian_method``.
+
     Args:
         W: [out_features, in_features] weight tensor
-        hessian: Hessian matrix — 2D [in, in] or 3D [num_blocks, bs, bs]
+        hessian: Hessian matrix — 2D [in, in], 3D [num_blocks, bs, bs],
+                 or DLR dict ``{"format": "dlr", "D": (n,), "U": (n, r)}``
         block_size: GPTQ block size for column processing
         damping: damping ratio as fraction of mean diagonal (default: 0.01)
         int_bits: quantization bit-width (4 or 8)
@@ -176,7 +175,8 @@ def gptq_quantize_layer(
                    (always asymmetric). INT8 defaults to symmetric; pass
                    True to use asymmetric.
         hessian_method: "hinv" (full inverse H⁻¹) or "cholesky" (Cholesky
-                       factor of H⁻¹). Default "hinv".
+                       factor of H⁻¹). Default "hinv".  Ignored for DLR
+                       Hessians (Woodbury is always used).
         piso_scales: Optional [out_features, 1] PiSO-optimal per-row scales.
                      When provided, these are used instead of computing absmax
                      scales.  The scales are clamped to the valid FP16 range
@@ -289,7 +289,29 @@ def gptq_quantize_layer(
     W_work = W.clone()
     used_triton = False
 
-    if hessian.dim() == 3:
+    if is_dlr(hessian):
+        # DLR: H⁻¹ via Woodbury, then standard 2-D GPTQ column loop.
+        D = hessian["D"].float()
+        U = hessian["U"].float()
+        if D.shape[0] != in_features:
+            raise ValueError(
+                f"DLR Hessian dim {D.shape[0]} != in_features {in_features}"
+            )
+        H_inv = woodbury_inverse(D, U, damping=damping, device=W.device)
+
+        if _gptq_block_triton(
+            W_work, quantized_W, row_scales, H_inv,
+            0, in_features, block_size, clamp_min, clamp_max,
+            row_zp=row_zp_int8,
+        ):
+            used_triton = True
+        else:
+            _gptq_block(
+                W_work, quantized_W, row_scales, H_inv,
+                0, in_features, block_size, clamp_min, clamp_max,
+                row_zp=row_zp_int8,
+            )
+    elif hessian.dim() == 3:
         num_blocks, bs, _ = hessian.shape
         for bi in range(num_blocks):
             col_start = bi * bs
@@ -334,7 +356,10 @@ def gptq_quantize_layer(
                 row_zp=row_zp_int8,
             )
     else:
-        raise ValueError(f"Expected 2D or 3D Hessian, got {hessian.dim()}D")
+        raise ValueError(
+            f"Expected 2D tensor, 3D tensor, or DLR dict Hessian, "
+            f"got {type(hessian).__name__}"
+        )
 
     accel = "Triton" if used_triton else "PyTorch"
     logger.debug("GPTQ: %s path, %dx%d, block_size=%d", accel, out_features, in_features, block_size)

@@ -12,6 +12,7 @@ import math
 
 import torch
 
+from .dlr import is_dlr, woodbury_inverse
 from .log import logger
 from .config import (
     ABS_SCALE_FLOOR, CONVERGENCE_EPS, CONVERGENCE_IMPROVEMENT_THRESHOLD,
@@ -114,7 +115,8 @@ def ldlq_quantize_layer(
 
     Args:
         W: [out_features, in_features] weight tensor
-        hessian: Proxy Hessian — 2D [in, in] or 3D [blocks, bs, bs].
+        hessian: Proxy Hessian — 2D [in, in], 3D [blocks, bs, bs], or DLR
+            dict ``{"format": "dlr", "D": (n,), "U": (n, r)}``.
             If None, falls back to H = W^T @ W / M (weight-only, not recommended).
         block_size: block size for column processing
         damping: damping ratio as fraction of mean diagonal (default: 0.01)
@@ -144,20 +146,33 @@ def ldlq_quantize_layer(
 
     # ── Compute or accept Hessian ──
     if hessian is not None:
-        hessian = hessian.float()
-        if hessian.dim() == 3:
-            # Block-diagonal Hessian: invert per-block into a full N×N matrix.
-            H_inv = _invert_block_diagonal_hessian(hessian, N, damping)
-        elif hessian.dim() == 2:
-            if hessian.shape != (N, N):
+        if is_dlr(hessian):
+            # DLR: H⁻¹ via Woodbury identity.
+            D = hessian["D"].float()
+            U = hessian["U"].float()
+            if D.shape[0] != N:
                 raise ValueError(
-                    f"Hessian shape {hessian.shape} != ({N}, {N})"
+                    f"DLR Hessian dim {D.shape[0]} != in_features {N}"
                 )
-            diag_mean = hessian.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
-            H_damped = hessian + damping * diag_mean * torch.eye(N, dtype=torch.float32)
-            H_inv = _invert_hessian(H_damped)
+            H_inv = woodbury_inverse(D, U, damping=damping)
         else:
-            raise ValueError(f"Expected 2D or 3D Hessian, got {hessian.dim()}D")
+            hessian = hessian.float()
+            if hessian.dim() == 3:
+                # Block-diagonal Hessian: invert per-block into a full N×N matrix.
+                H_inv = _invert_block_diagonal_hessian(hessian, N, damping)
+            elif hessian.dim() == 2:
+                if hessian.shape != (N, N):
+                    raise ValueError(
+                        f"Hessian shape {hessian.shape} != ({N}, {N})"
+                    )
+                diag_mean = hessian.diagonal().mean().clamp(min=DIAG_MEAN_FLOOR)
+                H_damped = hessian + damping * diag_mean * torch.eye(N, dtype=torch.float32)
+                H_inv = _invert_hessian(H_damped)
+            else:
+                raise ValueError(
+                    f"Expected 2D tensor, 3D tensor, or DLR dict Hessian, "
+                    f"got {hessian.dim()}D"
+                )
     else:
         # Fallback: weight-only Hessian (not what the papers describe).
         import warnings

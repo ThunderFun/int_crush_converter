@@ -43,6 +43,7 @@ from .smoothquant import (
 )
 from .smoothrot import detect_ffn_pairs
 from .svd import decompose_weight
+from .dlr import is_dlr, permute_dlr, make_dlr_dict, transform_dlr_for_smoothquant
 from .types import (
     BenchmarkConfig,
     BenchmarkReport,
@@ -578,7 +579,10 @@ def benchmark_method(
 
                 # Re-permute Hessian for self-computed permutations
                 if perm_applied and perm_orig is not None:
-                    if hessian.dim() == 2:
+                    if is_dlr(hessian):
+                        D_new, U_new = permute_dlr(hessian["D"], hessian["U"], perm_orig)
+                        hessian = make_dlr_dict(D_new, U_new)
+                    elif hessian.dim() == 2:
                         hessian = hessian[perm_orig][:, perm_orig]
                     else:
                         # Block-diagonal: un-permute W_work
@@ -593,23 +597,29 @@ def benchmark_method(
                 # Transform Hessian for SmoothQuant/SmoothRot
                 if smoothing_factors is not None and smooth_source is not None:
                     s = smoothing_factors.float()
-                    orig_dtype = hessian.dtype
-                    if hessian.dim() == 2:
-                        s_outer = (s.unsqueeze(0) * s.unsqueeze(1)).clamp(min=1e-16)
-                        hessian = (hessian.float() / s_outer).clamp(max=1e30).to(orig_dtype)
-                    elif hessian.dim() == 3:
-                        hessian_f = hessian.float().clone()
-                        for b in range(hessian.shape[0]):
-                            bs = hessian.shape[1]
-                            col_start = b * bs
-                            col_end = min(col_start + bs, s.shape[0])
-                            actual_bs = col_end - col_start
-                            s_block = s[col_start:col_end]
-                            s_outer = (s_block.unsqueeze(0) * s_block.unsqueeze(1)).clamp(min=1e-16)
-                            hessian_f[b, :actual_bs, :actual_bs] = (
-                                hessian[b, :actual_bs, :actual_bs].float() / s_outer
-                            ).clamp(max=1e30)
-                        hessian = hessian_f.to(orig_dtype)
+                    if is_dlr(hessian):
+                        D_new, U_new = transform_dlr_for_smoothquant(
+                            hessian["D"], hessian["U"], s
+                        )
+                        hessian = make_dlr_dict(D_new, U_new)
+                    else:
+                        orig_dtype = hessian.dtype
+                        if hessian.dim() == 2:
+                            s_outer = (s.unsqueeze(0) * s.unsqueeze(1)).clamp(min=1e-16)
+                            hessian = (hessian.float() / s_outer).clamp(max=1e30).to(orig_dtype)
+                        elif hessian.dim() == 3:
+                            hessian_f = hessian.float().clone()
+                            for b in range(hessian.shape[0]):
+                                bs = hessian.shape[1]
+                                col_start = b * bs
+                                col_end = min(col_start + bs, s.shape[0])
+                                actual_bs = col_end - col_start
+                                s_block = s[col_start:col_end]
+                                s_outer = (s_block.unsqueeze(0) * s_block.unsqueeze(1)).clamp(min=1e-16)
+                                hessian_f[b, :actual_bs, :actual_bs] = (
+                                    hessian[b, :actual_bs, :actual_bs].float() / s_outer
+                                ).clamp(max=1e30)
+                            hessian = hessian_f.to(orig_dtype)
 
                 result = gptq_quantize_layer(
                     W_work, hessian,
@@ -653,7 +663,10 @@ def benchmark_method(
 
                 # Re-permute Hessian for self-computed permutations
                 if perm_applied and perm_orig is not None:
-                    if ldlq_hessian.dim() == 2:
+                    if is_dlr(ldlq_hessian):
+                        D_new, U_new = permute_dlr(ldlq_hessian["D"], ldlq_hessian["U"], perm_orig)
+                        ldlq_hessian = make_dlr_dict(D_new, U_new)
+                    elif ldlq_hessian.dim() == 2:
                         ldlq_hessian = ldlq_hessian[perm_orig][:, perm_orig]
                     else:
                         inv_perm = perm_orig.argsort()
@@ -667,23 +680,29 @@ def benchmark_method(
                 # Transform Hessian for SmoothQuant/SmoothRot
                 if smoothing_factors is not None and smooth_source is not None:
                     s = smoothing_factors.float()
-                    orig_dtype = ldlq_hessian.dtype
-                    if ldlq_hessian.dim() == 2:
-                        s_outer = (s.unsqueeze(0) * s.unsqueeze(1)).clamp(min=1e-16)
-                        ldlq_hessian = (ldlq_hessian.float() / s_outer).clamp(max=1e30).to(orig_dtype)
-                    elif ldlq_hessian.dim() == 3:
-                        hessian_f = ldlq_hessian.float().clone()
-                        for b in range(ldlq_hessian.shape[0]):
-                            bs_blk = ldlq_hessian.shape[1]
-                            col_start = b * bs_blk
-                            col_end = min(col_start + bs_blk, s.shape[0])
-                            actual_bs = col_end - col_start
-                            s_block = s[col_start:col_end]
-                            s_outer = (s_block.unsqueeze(0) * s_block.unsqueeze(1)).clamp(min=1e-16)
-                            hessian_f[b, :actual_bs, :actual_bs] = (
-                                ldlq_hessian[b, :actual_bs, :actual_bs].float() / s_outer
-                            ).clamp(max=1e30)
-                        ldlq_hessian = hessian_f.to(orig_dtype)
+                    if is_dlr(ldlq_hessian):
+                        D_new, U_new = transform_dlr_for_smoothquant(
+                            ldlq_hessian["D"], ldlq_hessian["U"], s
+                        )
+                        ldlq_hessian = make_dlr_dict(D_new, U_new)
+                    else:
+                        orig_dtype = ldlq_hessian.dtype
+                        if ldlq_hessian.dim() == 2:
+                            s_outer = (s.unsqueeze(0) * s.unsqueeze(1)).clamp(min=1e-16)
+                            ldlq_hessian = (ldlq_hessian.float() / s_outer).clamp(max=1e30).to(orig_dtype)
+                        elif ldlq_hessian.dim() == 3:
+                            hessian_f = ldlq_hessian.float().clone()
+                            for b in range(ldlq_hessian.shape[0]):
+                                bs_blk = ldlq_hessian.shape[1]
+                                col_start = b * bs_blk
+                                col_end = min(col_start + bs_blk, s.shape[0])
+                                actual_bs = col_end - col_start
+                                s_block = s[col_start:col_end]
+                                s_outer = (s_block.unsqueeze(0) * s_block.unsqueeze(1)).clamp(min=1e-16)
+                                hessian_f[b, :actual_bs, :actual_bs] = (
+                                    ldlq_hessian[b, :actual_bs, :actual_bs].float() / s_outer
+                                ).clamp(max=1e30)
+                            ldlq_hessian = hessian_f.to(orig_dtype)
 
             result = ldlq_quantize_layer(
                 W_work,

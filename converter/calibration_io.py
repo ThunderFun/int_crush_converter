@@ -2,6 +2,7 @@
 
 import torch
 
+from .dlr import is_dlr, validate_dlr
 from .log import logger
 
 
@@ -61,26 +62,25 @@ def build_name_map(state_dict_keys: list[str], calibration_keys: list[str]) -> d
     return mapping
 
 
-def get_hessian(calibration: dict, layer_name: str, weight_shape: torch.Size) -> torch.Tensor | None:
-    """Get the Hessian tensor for a layer.
+def get_hessian(calibration: dict, layer_name: str, weight_shape: torch.Size) -> torch.Tensor | dict | None:
+    """Get the Hessian for a layer.
 
-    Returns raw Hessian — 2D [in, in] (full) or 3D [blocks, bs, bs] (block-diagonal).
-    Supports legacy stacked-tensor format and newer list-of-blocks format from
-    ComfyUI-GPTQ-Calibration (last block retains true size, zero-padded on stack).
-
-    Args:
-        calibration: The loaded calibration dict
-        layer_name: Calibration layer name (without .weight suffix)
-        weight_shape: Shape of the weight tensor [out_features, in_features]
-
-    Returns:
-        Hessian tensor, or None if not found
+    Returns 2D (full), 3D (block-diagonal), or DLR dict.
+    Returns None if not found or invalid.
     """
     hessians = calibration["hessians"]
     if layer_name not in hessians:
         return None
 
     H_raw = hessians[layer_name]
+
+    # --- DLR format (Diagonal + Low-Rank) -------------------------
+    if is_dlr(H_raw):
+        in_features = weight_shape[1]
+        if not validate_dlr(H_raw, in_features=in_features):
+            logger.warning("DLR Hessian for %s is invalid; skipping (RTN fallback)", layer_name)
+            return None
+        return dict(H_raw)  # shallow copy so callers can mutate safely
 
     # --- list-of-blocks format (ComfyUI-GPTQ-Calibration) --------
     if isinstance(H_raw, list):
@@ -203,6 +203,15 @@ def get_hessian_diag(calibration: dict, layer_name: str, in_features: int) -> to
         return None
 
     H_raw = hessians[layer_name]
+
+    # DLR: D is the residual diagonal; return true diagonal D + diag(UUᵀ).
+    if is_dlr(H_raw):
+        D = H_raw["D"].float()
+        U = H_raw["U"].float()
+        diag_full = D + (U * U).sum(dim=1)
+        if diag_full.shape[0] >= in_features:
+            return diag_full[:in_features]
+        return diag_full
 
     if isinstance(H_raw, list):
         # Block-diagonal: concatenate block diagonals

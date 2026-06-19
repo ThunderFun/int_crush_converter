@@ -182,6 +182,131 @@ class TestQuantizeModelGPTQ:
             ))
 
 
+# ── GPTQ with DLR Hessian path ───────────────────────────────────────────────
+
+
+class TestQuantizeModelGPTQDLR:
+    """Pipeline tests for GPTQ with DLR (Diagonal + Low-Rank) calibration."""
+
+    @staticmethod
+    def _make_dlr_calibration(layer_names: list[str], in_features_list: list[int],
+                               rank: int = 8) -> str:
+        """Create a calibration .pt file with DLR Hessians."""
+        import tempfile
+        from converter.dlr import make_dlr_dict
+
+        hessians = {}
+        shapes = {}
+        layer_types = {}
+        torch.manual_seed(42)
+        for name, in_feat in zip(layer_names, in_features_list):
+            X = torch.randn(32, in_feat)
+            H = X.T @ X
+            D = H.diagonal().clone()
+            eigvals, eigvecs = torch.linalg.eigh(H)
+            r = min(rank, in_feat)
+            U = eigvecs[:, -r:] * eigvals[-r:].clamp(min=0).sqrt().unsqueeze(0)
+            hessians[name] = make_dlr_dict(D, U)
+            shapes[name] = [in_feat, in_feat]
+            layer_types[name] = "linear"
+        data = {
+            "hessians": hessians,
+            "shapes": shapes,
+            "layer_types": layer_types,
+            "metadata": {"hessian_format": "dlr", "dlr_rank": rank},
+        }
+        path = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        torch.save(data, path)
+        return path
+
+    def test_gptq_dlr_basic(self, tmp_path, tmp_safetensors):
+        """Full pipeline: DLR calibration → GPTQ → safetensors output."""
+        input_path = tmp_safetensors()
+        output_dir = str(tmp_path / "output")
+        cal_path = self._make_dlr_calibration(
+            ["layers.0.q_proj", "layers.0.k_proj"], [64, 64], rank=8
+        )
+
+        quantize_model(QuantizeConfig(
+            input_path=input_path, output_dir=output_dir, rot_size=0,
+            quant_method="gptq", calibration_path=cal_path,
+        ))
+
+        result = load_file(os.path.join(output_dir, "model.safetensors"))
+        assert "layers.0.q_proj.weight" in result
+        assert "layers.0.q_proj.weight_scale" in result
+        assert "layers.0.q_proj.weight_zp" in result  # INT4 asymmetric
+
+    def test_gptq_dlr_int8(self, tmp_path, tmp_safetensors):
+        input_path = tmp_safetensors()
+        output_dir = str(tmp_path / "output")
+        cal_path = self._make_dlr_calibration(
+            ["layers.0.q_proj", "layers.0.k_proj"], [64, 64], rank=8
+        )
+
+        quantize_model(QuantizeConfig(
+            input_path=input_path, output_dir=output_dir, rot_size=0,
+            int_bits=8, quant_method="gptq", calibration_path=cal_path,
+        ))
+
+        result = load_file(os.path.join(output_dir, "model.safetensors"))
+        assert "layers.0.q_proj.weight" in result
+        assert "layers.0.q_proj.weight_scale" in result
+        assert "layers.0.q_proj.weight_zp" not in result  # INT8 symmetric
+
+    def test_gptq_dlr_with_rotation(self, tmp_path, tmp_safetensors):
+        """DLR + pre-rotated calibration + rotation at quantization time."""
+        input_path = tmp_safetensors(shapes=[(16, 64)])
+        output_dir = str(tmp_path / "output")
+        cal_path = self._make_dlr_calibration(["layers.0.q_proj"], [64], rank=8)
+
+        quantize_model(QuantizeConfig(
+            input_path=input_path, output_dir=output_dir, rot_size=16,
+            quant_method="gptq", calibration_path=cal_path,
+        ))
+
+        result = load_file(os.path.join(output_dir, "model.safetensors"))
+        assert "layers.0.q_proj.weight" in result
+        assert "layers.0.q_proj.weight_scale" in result
+
+    def test_gptq_dlr_pre_rotated_calibration(self, tmp_path, tmp_safetensors):
+        """DLR calibration already in rotated space (hessian_rotated=True)."""
+        from converter.rotation import rotate_activations
+        from converter.dlr import make_dlr_dict
+
+        input_path = tmp_safetensors(shapes=[(16, 64)])
+        output_dir = str(tmp_path / "output")
+        rot_size = 64
+
+        # Create DLR calibration with pre-rotated Hessian
+        torch.manual_seed(42)
+        X = torch.randn(32, 64)
+        X_rot = rotate_activations(X, rot_size)
+        H_rot = X_rot.T @ X_rot
+        D = H_rot.diagonal().clone()
+        eigvals, eigvecs = torch.linalg.eigh(H_rot)
+        U = eigvecs[:, -8:] * eigvals[-8:].clamp(min=0).sqrt().unsqueeze(0)
+
+        import tempfile
+        cal_data = {
+            "hessians": {"layers.0.q_proj": make_dlr_dict(D, U)},
+            "shapes": {"layers.0.q_proj": [64, 64]},
+            "layer_types": {"layers.0.q_proj": "linear"},
+            "metadata": {"hessian_rotated": True, "rot_size": rot_size,
+                         "hessian_format": "dlr", "dlr_rank": 8},
+        }
+        cal_path = tempfile.NamedTemporaryFile(suffix=".pt", delete=False).name
+        torch.save(cal_data, cal_path)
+
+        quantize_model(QuantizeConfig(
+            input_path=input_path, output_dir=output_dir, rot_size=rot_size,
+            quant_method="gptq", calibration_path=cal_path,
+        ))
+
+        result = load_file(os.path.join(output_dir, "model.safetensors"))
+        assert "layers.0.q_proj.weight" in result
+
+
 # ── LDLQ path ────────────────────────────────────────────────────────────────
 
 
