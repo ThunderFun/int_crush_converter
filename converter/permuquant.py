@@ -205,7 +205,7 @@ def sweep_alpha(
 
     if best_perm is None:
         # No permutation accepted; return identity
-        best_perm = torch.arange(W.shape[1])
+        best_perm = torch.arange(W.shape[1], device=W.device)
         best_accepted = False
 
     return best_perm, best_alpha, best_accepted

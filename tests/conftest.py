@@ -82,7 +82,7 @@ def tmp_calibration(tmp_path):
                 blocks = []
                 for _ in range(num_blocks):
                     X = torch.randn(32, block_size)
-                    blocks.append(X.T @ X)
+                    blocks.append(X.T @ X / 32.0)
                 hessians[name] = torch.stack(blocks)
             else:
                 X = torch.randn(32, in_feat)
@@ -141,7 +141,7 @@ def make_block_diagonal_hessian(
     blocks = []
     for _ in range(num_blocks):
         X = torch.randn(num_samples, block_size)
-        blocks.append(X.T @ X)
+        blocks.append(X.T @ X / float(num_samples))
     return torch.stack(blocks)
 
 

@@ -16,6 +16,7 @@ import torch
 
 from .log import logger
 from .config import _HAS_TRITON
+from .rounding import _round_half_away_from_zero
 
 
 def compute_piso_scales_int8(
@@ -108,7 +109,7 @@ def _compute_piso_scales_int8_pytorch(
         s_coarse = s_absmax * coarse_factors.unsqueeze(0)  # [B, C]
         W_3d = W_batch.unsqueeze(1)         # [B, 1, D]
         s_3d = s_coarse.unsqueeze(2)        # [B, C, 1]
-        q = (W_3d / s_3d).round().clamp(-128, 127)
+        q = _round_half_away_from_zero(W_3d / s_3d).clamp(-128, 127)
         cost = ((W_3d - q * s_3d) ** 2 * h_diag).sum(dim=2)  # [B, C]
         best_idx = cost.argmin(dim=1)
         best_scale = s_coarse[torch.arange(B), best_idx]
@@ -116,7 +117,7 @@ def _compute_piso_scales_int8_pytorch(
         # Fine search
         s_fine = best_scale.unsqueeze(1) * fine_factors.unsqueeze(0)  # [B, F]
         s_3d_fine = s_fine.unsqueeze(2)
-        q_fine = (W_3d / s_3d_fine).round().clamp(-128, 127)
+        q_fine = _round_half_away_from_zero(W_3d / s_3d_fine).clamp(-128, 127)
         cost_fine = ((W_3d - q_fine * s_3d_fine) ** 2 * h_diag).sum(dim=2)
         best_fine_idx = cost_fine.argmin(dim=1)
         scales[start:end, 0] = s_fine[torch.arange(B), best_fine_idx]
@@ -216,8 +217,8 @@ def _compute_piso_scales_int8_asymmetric_pytorch(
         s_coarse = s_coarse.clamp(min=1e-10)
         W_3d = W_batch.unsqueeze(1)  # [B, 1, D]
         s_3d = s_coarse.unsqueeze(2)  # [B, C, 1]
-        zp_3d = (-128 - w_min.unsqueeze(2) / s_3d).round().clamp(-128, 127)  # [B, C, 1]
-        q = (W_3d / s_3d + zp_3d).round().clamp(-128, 127)
+        zp_3d = _round_half_away_from_zero(-128 - w_min.unsqueeze(2) / s_3d).clamp(-128, 127)  # [B, C, 1]
+        q = _round_half_away_from_zero(W_3d / s_3d + zp_3d).clamp(-128, 127)
         dequant = (q - zp_3d) * s_3d
         cost = ((W_3d - dequant) ** 2 * h_diag).sum(dim=2)  # [B, C]
         best_idx = cost.argmin(dim=1)  # [B]
@@ -228,8 +229,8 @@ def _compute_piso_scales_int8_asymmetric_pytorch(
         s_fine = best_scale.unsqueeze(1) * fine_factors.unsqueeze(0)  # [B, F]
         s_fine = s_fine.clamp(min=1e-10)
         s_3d_fine = s_fine.unsqueeze(2)
-        zp_3d_fine = (-128 - w_min.unsqueeze(2) / s_3d_fine).round().clamp(-128, 127)
-        q_fine = (W_3d / s_3d_fine + zp_3d_fine).round().clamp(-128, 127)
+        zp_3d_fine = _round_half_away_from_zero(-128 - w_min.unsqueeze(2) / s_3d_fine).clamp(-128, 127)
+        q_fine = _round_half_away_from_zero(W_3d / s_3d_fine + zp_3d_fine).clamp(-128, 127)
         dequant_fine = (q_fine - zp_3d_fine) * s_3d_fine
         cost_fine = ((W_3d - dequant_fine) ** 2 * h_diag).sum(dim=2)
         best_fine_idx = cost_fine.argmin(dim=1)

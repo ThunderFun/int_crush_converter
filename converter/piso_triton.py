@@ -309,6 +309,9 @@ def compute_piso_scales_int8_triton(
         return None
     if not torch.cuda.is_available():
         return None
+    if num_coarse < 2 or num_fine < 2:
+        logger.warning("PiSO: num_coarse and num_fine must be >= 2, got %d and %d", num_coarse, num_fine)
+        return None
 
     M, D = W.shape
     if not W.is_contiguous():
@@ -367,6 +370,9 @@ def compute_piso_scales_int8_asymmetric_triton(
     if not _HAS_TRITON:
         return None
     if not torch.cuda.is_available():
+        return None
+    if num_coarse < 2 or num_fine < 2:
+        logger.warning("PiSO: num_coarse and num_fine must be >= 2, got %d and %d", num_coarse, num_fine)
         return None
 
     M, D = W.shape

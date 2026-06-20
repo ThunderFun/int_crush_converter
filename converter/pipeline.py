@@ -5,6 +5,7 @@ Usage:
     python -m converter -i in.safetensors -o out/ --rot-size 256 -c cal.pt --quant-method gptq
 """
 
+import copy
 import json
 import os
 import time
@@ -202,6 +203,9 @@ def quantize_model(
             "Consider using --int-bits 8 with --smoothquant."
         )
 
+    # Make a shallow copy so we don't mutate the caller's config object.
+    config = copy.copy(config)
+
     # SmoothRot W4 safeguard: auto-disable SmoothRot for INT4 unless overridden.
     # At W4, the per-channel dynamic range of the smoothed weight can exceed
     # INT4's 16-level representable range, degrading quality.
@@ -281,6 +285,14 @@ def quantize_model(
             W = tensor.float()
             if config.rot_size > 0:
                 W = rotate_weights(W, config.rot_size)
+
+            # Pad h_diag to match W's (possibly padded) in_features.
+            # Rotation may pad W to a multiple of rot_size, but h_diag
+            # still has the original in_features length.
+            if h_diag.shape[0] < W.shape[1]:
+                h_diag = torch.nn.functional.pad(
+                    h_diag, (0, W.shape[1] - h_diag.shape[0])
+                )
 
             # Apply SmoothQuant *before* PiSO so scales are computed on the
             # smoothed weight (the same weight GPTQ will quantize).
@@ -454,7 +466,6 @@ def quantize_model(
     permuted = 0
     gptq_count = 0
     rtn_fallback = 0
-    piso_count = 0
     smoothquant_count = 0
     svd_count = 0
     rot_size_mismatch_warned = False
@@ -500,15 +511,7 @@ def quantize_model(
                     outlier_count, name, WEIGHT_OUTLIER_CLAMP,
                 )
 
-        # 0.7 SVD-absorbed: decompose W into low-rank FP16 + quantizable residual.
-        svd_result = None
-        if config.svd_rank > 0:
-            svd_result = decompose_weight(W, rank=config.svd_rank)
-            W = svd_result.residual  # downstream pipeline quantizes this
-            svd_count += 1
-            logger.debug("SVD: rank=%d for %s, residual norm=%.4f",
-                         svd_result.L1.shape[1], name,
-                         svd_result.residual.norm().item())
+        # 0.7 SVD-absorbed placeholder (applied AFTER rotation below).
 
         # 1. Rotate weights (skip if rot_size == 0).
         #    Clone only when downstream mutates W_work in-place (GPTQ/LDLQ,
@@ -529,6 +532,17 @@ def quantize_model(
             W_work = W.clone()
         else:
             W_work = W  # RTN, no rotation, no PermuQuant — read-only
+
+        # 0.7 SVD-absorbed: decompose W_work (rotated) into low-rank FP16 + quantizable residual.
+        # Applied AFTER rotation so both L1/L2 and the residual are in rotated space.
+        svd_result = None
+        if config.svd_rank > 0:
+            svd_result = decompose_weight(W_work, rank=config.svd_rank)
+            W_work = svd_result.residual  # downstream pipeline quantizes this
+            svd_count += 1
+            logger.debug("SVD: rank=%d for %s, residual norm=%.4f",
+                         svd_result.L1.shape[1], name,
+                         svd_result.residual.norm().item())
 
         # 2. PermuQuant: channel reordering.
         #    If calibration provides a permutation (already in Hessians), use it directly.
@@ -875,12 +889,6 @@ def quantize_model(
                     scales = calculate_scales(W_work, in_features, clipping_ratios=config.clipping_ratios)
                     quantized_W = quantize_weights(W_work, scales, in_features)
 
-        # 4. Pack (INT4) or store directly (INT8)
-        if is_int8:
-            stored_weights = quantized_W
-        else:
-            stored_weights = pack_int4(quantized_W)
-
         # 5. Verify: dequantize and compare to working weights.
         #    Use float64 for MSE to prevent overflow when scales are very large.
         if zero_points is not None:
@@ -916,6 +924,11 @@ def quantize_model(
                     asym_scales = ((w_max - w_min).float() / 255.0).clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
                 else:
                     asym_scales = ((w_max - w_min).float() / 15.0).clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
+                # Apply _fix_asymmetric_scale to handle zero-point clamping
+                from .scales import _fix_asymmetric_scale
+                qmin = -128 if is_int8 else -8
+                qmax = 127 if is_int8 else 7
+                asym_scales = _fix_asymmetric_scale(asym_scales, w_min, w_max, qmin, qmax)
                 # Use asymmetric scale where it produced valid values; fall back
                 # to symmetric otherwise (e.g. when W_work itself has NaN/Inf).
                 asym_ok = bad_mask & torch.isfinite(asym_scales) & (asym_scales > 0)
@@ -932,17 +945,39 @@ def quantize_model(
                     r_w_min = W_work[r].amin()
                     r_zp = (clamp_min - _round_half_away_from_zero(r_w_min / r_s)).clamp(clamp_min, clamp_max)
                     zero_points[r] = r_zp.to(zero_points.dtype)
-                    quantized_W[r] = ((W_work[r] / r_s + r_zp.to(W_work.dtype)).round().clamp(clamp_min, clamp_max)).to(torch.int8)
+                    quantized_W[r] = (_round_half_away_from_zero(W_work[r] / r_s + r_zp.to(W_work.dtype)).clamp(clamp_min, clamp_max)).to(torch.int8)
             else:
                 scales = torch.where(bad_mask, sym_scales, scales)
                 # Re-quantize affected rows with the repaired scales.
                 clamp_min = -128 if is_int8 else -8
                 clamp_max = 127 if is_int8 else 7
+                # For INT4, always use asymmetric quantization to match GPTQ path
+                if not is_int8:
+                    w_min = W_work.amin(dim=1, keepdim=True)
+                    w_max = W_work.amax(dim=1, keepdim=True)
+                    asym_scales = ((w_max - w_min).float() / 15.0).clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
+                    from .scales import _fix_asymmetric_scale
+                    asym_scales = _fix_asymmetric_scale(asym_scales, w_min, w_max, -8, 7)
+                    asym_ok = bad_mask & torch.isfinite(asym_scales) & (asym_scales > 0)
+                    fix_scales = torch.where(asym_ok, asym_scales, sym_scales)
+                    scales = torch.where(bad_mask, fix_scales, scales)
                 bad_row_idx = bad_mask.squeeze(1).nonzero(as_tuple=True)[0]
                 for r in bad_row_idx:
                     r_s = scales[r].to(W_work.dtype)
-                    quantized_W[r] = ((W_work[r] / r_s).round().clamp(clamp_min, clamp_max)).to(torch.int8)
+                    if not is_int8:
+                        # INT4: use asymmetric (with zero-point) to match GPTQ
+                        r_w_min = W_work[r].amin()
+                        r_zp = (-8 - _round_half_away_from_zero(r_w_min / r_s)).clamp(-8, 7)
+                        quantized_W[r] = (_round_half_away_from_zero(W_work[r] / r_s + r_zp.to(W_work.dtype)).clamp(-8, 7)).to(torch.int8)
+                    else:
+                        quantized_W[r] = (_round_half_away_from_zero(W_work[r] / r_s).clamp(clamp_min, clamp_max)).to(torch.int8)
             logger.warning("Replaced %d bad scale values in %s (Inf/NaN/zero); quality may be degraded", n_bad, name)
+
+        # 4. Pack (INT4) or store directly (INT8) — AFTER repair so packed bytes reflect repaired weights.
+        if is_int8:
+            stored_weights = quantized_W
+        else:
+            stored_weights = pack_int4(quantized_W)
 
         # Collect per-layer metrics for quality report
         if config.quality_report_path is not None:
@@ -1051,7 +1086,6 @@ def quantize_model(
     output_size = sum(
         t.numel() * t.element_size()
         for k, t in output_dict.items()
-        if k != "__metadata__"
     ) / (1024**3)
 
     logger.info("Done! Quantized %d layers, skipped %d layers", quantized, skipped)

@@ -313,7 +313,11 @@ def _inverse_rotate(W_rotated: torch.Tensor, rot_size: int, orig_in_features: in
     W_rot = W @ H^T is W = W_rot @ H^T.  But since H = H^T for regular
     Hadamard, the forward and inverse are the same operation.
     """
-    H = get_hadamard(rot_size, dtype=torch.float32, device=str(W_rotated.device))
+    from .rotation import _is_power_of_four, make_hadamard_sylvester
+    if _is_power_of_four(rot_size):
+        H = get_hadamard(rot_size, dtype=torch.float32, device=str(W_rotated.device))
+    else:
+        H = make_hadamard_sylvester(rot_size, dtype=torch.float32, device=str(W_rotated.device))
     out_features, in_features_padded = W_rotated.shape
     n_groups = in_features_padded // rot_size
     W_grouped = W_rotated.reshape(out_features, n_groups, rot_size)

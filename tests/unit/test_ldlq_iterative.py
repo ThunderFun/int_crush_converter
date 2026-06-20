@@ -21,7 +21,7 @@ class TestLDLQIterative:
         flat_scales = (W.abs().amax(dim=1, keepdim=True) / 7.0).clamp(min=1e-6)
         flat_scales = flat_scales.expand(M, N).reshape(-1).clone()
 
-        Q_result, final_scales = _run_iterative_ldlq(
+        Q_result, final_scales, _ = _run_iterative_ldlq(
             W, H_inv, flat_scales, iterations=5, block_size=32,
             clamp_min=-8, clamp_max=7,
         )

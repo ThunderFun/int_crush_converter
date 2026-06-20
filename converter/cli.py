@@ -11,7 +11,7 @@ import os
 import sys
 
 from .log import logger
-from .pipeline import quantize_model, DEFAULT_SKIP_PATTERNS
+from .pipeline import quantize_model
 from .types import ProgressInfo, ProgressSummary, QuantizeConfig
 
 # ANSI escape codes.

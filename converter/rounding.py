@@ -95,7 +95,7 @@ def _gptq_block(
             # Eager intra-block update: propagate error to remaining columns
             # in this sub-block using the corresponding row of H_inv.
             if j_offset < actual_blk - 1:
-                W_work[:, j_global:col_start + blk_end] -= err.unsqueeze(1) * H_inv[j_local, j_local:blk_end].unsqueeze(0)
+                W_work[:, j_global + 1:col_start + blk_end] -= err.unsqueeze(1) * H_inv[j_local, j_local + 1:blk_end].unsqueeze(0)
 
         # Lazy inter-block update: apply accumulated errors to all columns
         # after this sub-block in one matmul.

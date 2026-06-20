@@ -75,6 +75,9 @@ def calculate_scales(W: torch.Tensor, group_size: int = 128,
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
 
+    if clipping_ratios is not None and len(clipping_ratios) == 0:
+        clipping_ratios = None
+
     W_padded = _pad_to_group_size(W, group_size)
     out_features, in_features = W_padded.shape
     num_groups = in_features // group_size
@@ -116,7 +119,7 @@ def quantize_weights(W: torch.Tensor, scales: torch.Tensor, group_size: int = 12
     num_groups = in_features // group_size
     W_grouped = W.reshape(out_features, num_groups, group_size)
     W_scaled = W_grouped / scales.unsqueeze(2).to(W.dtype)
-    W_rounded = W_scaled.round().clamp(-8, 7)
+    W_rounded = _round_half_away_from_zero(W_scaled).clamp(-8, 7)
     return W_rounded.reshape(out_features, in_features).to(torch.int8)
 
 
@@ -134,6 +137,9 @@ def calculate_scales_int8(W: torch.Tensor,
     """
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
+
+    if clipping_ratios is not None and len(clipping_ratios) == 0:
+        clipping_ratios = None
 
     max_vals = W.abs().amax(dim=1, keepdim=True)
 
@@ -168,7 +174,7 @@ def quantize_weights_int8(W: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
 
     W_scaled = W / scales.to(W.dtype)
-    W_rounded = W_scaled.round().clamp(-128, 127)
+    W_rounded = _round_half_away_from_zero(W_scaled).clamp(-128, 127)
     return W_rounded.to(torch.int8)
 
 
@@ -242,6 +248,9 @@ def calculate_scales_asymmetric(W: torch.Tensor, group_size: int = 128,
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
 
+    if clipping_ratios is not None and len(clipping_ratios) == 0:
+        clipping_ratios = None
+
     W_padded = _pad_to_group_size(W, group_size)
     out_features, in_features = W_padded.shape
     num_groups = in_features // group_size
@@ -300,7 +309,7 @@ def quantize_weights_asymmetric(
     W_grouped = W.reshape(out_features, num_groups, group_size)
     W_scaled = (W_grouped / scales.unsqueeze(2).to(W.dtype)
                 + zero_points.unsqueeze(2).to(W.dtype))
-    W_rounded = W_scaled.round().clamp(-8, 7)
+    W_rounded = _round_half_away_from_zero(W_scaled).clamp(-8, 7)
     return W_rounded.reshape(out_features, in_features).to(torch.int8)
 
 
@@ -322,6 +331,9 @@ def calculate_scales_int8_asymmetric(
     """
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
+
+    if clipping_ratios is not None and len(clipping_ratios) == 0:
+        clipping_ratios = None
 
     w_min = W.amin(dim=1, keepdim=True)
     w_max = W.amax(dim=1, keepdim=True)
@@ -368,5 +380,5 @@ def quantize_weights_int8_asymmetric(
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
 
     W_scaled = (W / scales.to(W.dtype) + zero_points.to(W.dtype))
-    W_rounded = W_scaled.round().clamp(-128, 127)
+    W_rounded = _round_half_away_from_zero(W_scaled).clamp(-128, 127)
     return W_rounded.to(torch.int8)

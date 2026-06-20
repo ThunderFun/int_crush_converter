@@ -157,6 +157,7 @@ def ldlq_quantize_layer(
             H_inv = woodbury_inverse(D, U, damping=damping)
         else:
             hessian = hessian.float()
+            H = hessian  # Keep H available for greedy search
             if hessian.dim() == 3:
                 # Block-diagonal Hessian: invert per-block into a full N×N matrix.
                 H_inv = _invert_block_diagonal_hessian(hessian, N, damping)
@@ -214,11 +215,11 @@ def ldlq_quantize_layer(
     flat_scales = row_scales.expand(M, N).reshape(-1).clone()
 
     if iterations > 1:
-        quantized_W, _ = _run_iterative_ldlq(
+        quantized_W, _, method_used = _run_iterative_ldlq(
             W, H_inv, flat_scales, iterations, block_size, clamp_min, clamp_max,
         )
     else:
-        quantized_W = _single_ldlq_pass(W, H_inv, flat_scales, block_size, clamp_min, clamp_max)
+        quantized_W, method_used = _single_ldlq_pass(W, H_inv, flat_scales, block_size, clamp_min, clamp_max)
 
     # Greedy local search: coordinate descent on the quantization grid.
     if greedy_passes > 0:
@@ -266,14 +267,6 @@ def ldlq_quantize_layer(
     dequant = quantized_W.float() * final_scales.float()
     mse = (W - dequant).double().pow(2).mean().item()
     max_err = (W - dequant).abs().max().item()
-
-    # Determine method used (best-effort: based on device and Triton availability)
-    if _HAS_TRITON and W.device.type == "cuda":
-        method_used = "ldlq_triton"
-    elif _HAS_TORCH_COMPILE:
-        method_used = "ldlq_compile"
-    else:
-        method_used = "ldlq_cpu"
 
     return QuantizationResult(
         quantized_W=quantized_W,
@@ -337,6 +330,7 @@ def _single_ldlq_pass(
         scale_2d = scale_2d.clamp(min=SANITIZE_FLOOR)
 
     # Choose processing strategy: Triton > torch.compile > eager
+    actual_method = "ldlq_cpu"
     if target_device.type == "cpu":
         logger.debug("LDLQ: CPU path, %dx%d, block_size=%d", M, N, block_size)
         Q_prime = _ldlq_loop_cpu(W_work, H_inv, scale_2d, Q_prime, N, M, block_size, clamp_min, clamp_max)
@@ -347,18 +341,21 @@ def _single_ldlq_pass(
             if result is not None:
                 logger.debug("LDLQ: GPU path (Triton), %dx%d, block_size=%d", M, N, block_size)
                 Q_prime = result
+                actual_method = "ldlq_triton"
             else:
                 compiled_fn = _get_ldlq_compiled_fn()
                 accel = "torch.compile" if compiled_fn is not None else "eager"
                 logger.debug("LDLQ: GPU path (%s), %dx%d, block_size=%d", accel, M, N, block_size)
                 Q_prime = _ldlq_loop_gpu(W_work, H_inv, scale_2d, Q_prime, N, M, block_size, clamp_min, clamp_max,
                                          compiled_fn=compiled_fn)
+                actual_method = "ldlq_compile" if compiled_fn is not None else "ldlq_cpu"
         else:
             compiled_fn = _get_ldlq_compiled_fn()
             accel = "torch.compile" if compiled_fn is not None else "eager"
             logger.debug("LDLQ: GPU path (%s), %dx%d, block_size=%d", accel, M, N, block_size)
             Q_prime = _ldlq_loop_gpu(W_work, H_inv, scale_2d, Q_prime, N, M, block_size, clamp_min, clamp_max,
                                       compiled_fn=compiled_fn)
+            actual_method = "ldlq_compile" if compiled_fn is not None else "ldlq_cpu"
 
     # Move result back to original device
     if Q_prime.device != original_device:
@@ -366,7 +363,7 @@ def _single_ldlq_pass(
 
     # Clamp to valid range
     Q_prime = Q_prime.clamp(clamp_min, clamp_max)
-    return Q_prime
+    return Q_prime, actual_method
 
 
 def _ldlq_loop_cpu(
@@ -510,10 +507,12 @@ def _run_iterative_ldlq(
 
     mse_values = []
     prev_scales = None
+    actual_method = "ldlq_cpu"
 
     for iter_idx in range(iterations):
-        Q_iter = _single_ldlq_pass(W, H_inv, current_scales, block_size, clamp_min, clamp_max)
+        Q_iter, iter_method = _single_ldlq_pass(W, H_inv, current_scales, block_size, clamp_min, clamp_max)
         Q_result = Q_iter
+        actual_method = iter_method  # Track the actual backend used
 
         # Compute MSE
         mse = (W - Q_iter.float() * current_scales.reshape(M, N)).double().abs().pow(2).mean().item()
@@ -548,10 +547,7 @@ def _run_iterative_ldlq(
         # Q_result holds a reference to Q_iter; on the next iteration
         # Q_iter is reassigned (not mutated), so the old tensor is freed.
 
-    if len(mse_values) > 1:
-        mse_str = " ".join([f"{m:.6f}" for m in mse_values])
-
-    return Q_result, current_scales
+    return Q_result, current_scales, actual_method
 
 
 def _update_ldlq_scales(

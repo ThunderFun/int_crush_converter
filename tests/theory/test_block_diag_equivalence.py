@@ -24,7 +24,7 @@ class TestBlockDiagonalHessianEquivalence:
         H_inv_full = _invert_hessian(H_rot + 0.01 * diag_mean * torch.eye(N))
         row_scales = (W_rot.abs().amax(dim=1, keepdim=True) / 7.0).clamp(min=1e-6)
         flat_scales = row_scales.expand(M, N).reshape(-1).clone()
-        Q_full = _single_ldlq_pass(W_rot, H_inv_full, flat_scales, block_size=16,
+        Q_full, _ = _single_ldlq_pass(W_rot, H_inv_full, flat_scales, block_size=16,
                                    clamp_min=-8, clamp_max=7)
 
         # Block-wise LDLQ
@@ -38,7 +38,7 @@ class TestBlockDiagonalHessianEquivalence:
             diag_g = H_g.diagonal().mean().clamp(min=1e-6)
             H_g_inv = _invert_hessian(H_g + 0.01 * diag_g * torch.eye(rot_size))
             scales_g = flat_scales.reshape(M, N)[:, start:end].reshape(-1).clone()
-            Q_g = _single_ldlq_pass(W_g, H_g_inv, scales_g, block_size=16,
+            Q_g, _ = _single_ldlq_pass(W_g, H_g_inv, scales_g, block_size=16,
                                     clamp_min=-8, clamp_max=7)
             Q_blocks[:, start:end] = Q_g
 

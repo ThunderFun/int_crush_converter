@@ -44,7 +44,7 @@ class TestConvRotPipeline:
         row_scales = (W_rot.abs().amax(dim=1, keepdim=True) / 7.0).clamp(min=1e-6)
         flat_scales = row_scales.expand(M, N).reshape(-1).clone()
 
-        Q, _ = _run_iterative_ldlq(
+        Q, _, _ = _run_iterative_ldlq(
             W_rot, H_inv, flat_scales, iterations=3, block_size=32,
             clamp_min=-8, clamp_max=7,
         )
