@@ -35,7 +35,7 @@ from .permuquant import sweep_alpha
 from .calibration_io import load_calibration, build_name_map, get_hessian, get_permutation, get_hessian_diag, get_per_channel_amax
 from .gptq import gptq_quantize_layer, gptq_quantize_layer_rtn
 from .ldlq import ldlq_quantize_layer
-from .piso import compute_piso_scales_int8
+from .piso import compute_piso_scales_int8, compute_piso_scales_int4_asymmetric
 from .rounding import _round_half_away_from_zero
 from .smoothquant import (
     compute_smoothing_factors,
@@ -267,7 +267,8 @@ def quantize_model(
 
     # ── PiSO: precompute data-aware optimal scales ──
     piso_scales_dict: dict[str, torch.Tensor] = {}
-    if config.piso_scales and calibration is not None and is_int8:
+    piso_zp_dict: dict[str, torch.Tensor] = {}
+    if config.piso_scales and calibration is not None:
         # Count eligible layers first for progress reporting
         piso_eligible = [
             (name, tensor) for name, tensor in state_dict.items()
@@ -320,8 +321,13 @@ def quantize_model(
 
             layer_start = time.monotonic()
             try:
-                scales = compute_piso_scales_int8(W, h_diag)
-                piso_scales_dict[name] = scales
+                if is_int8:
+                    scales = compute_piso_scales_int8(W, h_diag)
+                    piso_scales_dict[name] = scales
+                else:
+                    scales, zps = compute_piso_scales_int4_asymmetric(W, h_diag)
+                    piso_scales_dict[name] = scales      # per-row scales [out, 1]
+                    piso_zp_dict[name] = zps             # per-row zero-points [out, 1]
                 piso_count += 1
             except Exception as exc:
                 logger.warning("PiSO failed for %s: %s", layer_name, exc)
@@ -439,6 +445,8 @@ def quantize_model(
     if config.piso_scales and piso_scales_dict:
         metadata["int_crush.piso"] = "true"
         metadata["int_crush.piso_layers"] = str(len(piso_scales_dict))
+        if piso_zp_dict:
+            metadata["int_crush.piso_zero_points"] = str(len(piso_zp_dict))
     if config.quant_method == "gptq":
         metadata[f"{meta_prefix}.gptq_block_size"] = str(config.gptq_block_size)
         metadata[f"{meta_prefix}.damping_ratio"] = str(config.damping)
@@ -763,6 +771,7 @@ def quantize_model(
                     asymmetric=config.asymmetric,
                     hessian_method=config.hessian_method,
                     piso_scales=piso_scales_dict.get(name),
+                    piso_zero_points=piso_zp_dict.get(name),
                 )
                 quantized_W = result.quantized_W
                 scales = result.scales
@@ -774,6 +783,7 @@ def quantize_model(
                     W_work, int_bits=config.int_bits,
                     asymmetric=config.asymmetric, clipping_ratios=config.clipping_ratios,
                     piso_scales=piso_scales_dict.get(name),
+                    piso_zero_points=piso_zp_dict.get(name),
                 )
                 quantized_W = result.quantized_W
                 scales = result.scales
@@ -961,6 +971,11 @@ def quantize_model(
                     asym_ok = bad_mask & torch.isfinite(asym_scales) & (asym_scales > 0)
                     fix_scales = torch.where(asym_ok, asym_scales, sym_scales)
                     scales = torch.where(bad_mask, fix_scales, scales)
+                # INT4: quantized asymmetrically, so we must store zero-points
+                # for the repaired rows.  (Non-repaired INT4 rows were already
+                # quantized symmetrically, so their zp=0 is correct.)
+                if not is_int8:
+                    zero_points = torch.zeros(W_work.shape[0], 1, dtype=torch.int8)
                 bad_row_idx = bad_mask.squeeze(1).nonzero(as_tuple=True)[0]
                 for r in bad_row_idx:
                     r_s = scales[r].to(W_work.dtype)
@@ -969,6 +984,7 @@ def quantize_model(
                         r_w_min = W_work[r].amin()
                         r_zp = (-8 - _round_half_away_from_zero(r_w_min / r_s)).clamp(-8, 7)
                         quantized_W[r] = (_round_half_away_from_zero(W_work[r] / r_s + r_zp.to(W_work.dtype)).clamp(-8, 7)).to(torch.int8)
+                        zero_points[r] = r_zp.to(zero_points.dtype)
                     else:
                         quantized_W[r] = (_round_half_away_from_zero(W_work[r] / r_s).clamp(clamp_min, clamp_max)).to(torch.int8)
             logger.warning("Replaced %d bad scale values in %s (Inf/NaN/zero); quality may be degraded", n_bad, name)

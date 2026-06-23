@@ -14,6 +14,7 @@ from .scales import (
     calculate_scales_int8, quantize_weights_int8,
     calculate_scales_asymmetric, quantize_weights_asymmetric,
     calculate_scales_int8_asymmetric, quantize_weights_int8_asymmetric,
+    _fix_asymmetric_scale,
 )
 from .config import DIAG_MEAN_FLOOR, SCALE_FLOOR, SCALE_MIN, SCALE_MAX, SCALE_DTYPE, INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
 from .rounding import _invert_hessian, _gptq_block, _round_half_away_from_zero
@@ -142,6 +143,7 @@ def gptq_quantize_layer(
     asymmetric: bool = False,
     hessian_method: str = "hinv",
     piso_scales: torch.Tensor | None = None,
+    piso_zero_points: torch.Tensor | None = None,
 ) -> QuantizationResult:
     """Quantize a weight matrix using GPTQ.
 
@@ -181,6 +183,10 @@ def gptq_quantize_layer(
                      When provided, these are used instead of computing absmax
                      scales.  The scales are clamped to the valid FP16 range
                      before use.  See arXiv:2606.10890.
+        piso_zero_points: Optional [out_features, 1] PiSO-optimal per-row
+                          zero-points (int8).  Used with INT4 PiSO where both
+                          scales and zero-points are jointly optimized.
+                          Ignored for INT8.
 
     Returns:
         QuantizationResult with quantized_W, scales, zero_points, method_used, and fallbacks.
@@ -201,14 +207,39 @@ def gptq_quantize_layer(
     clamp_max = 127 if int_bits == 8 else 7
 
     # ── PiSO scales: use data-aware optimal scales when provided ──
+    if piso_scales is not None and int_bits == 4:
+        piso = piso_scales.float().to(W.device)
+        if piso.shape == (out_features, 1):
+            row_scales = piso.clamp(min=SCALE_MIN, max=SCALE_MAX)
+            if piso_zero_points is not None:
+                # Use PiSO-optimized zero-points directly
+                row_zp = piso_zero_points.float().to(W.device).clamp(-8, 7)
+            else:
+                # Derive zp from PiSO scale (with _fix_asymmetric_scale)
+                w_min = W.amin(dim=1, keepdim=True)
+                w_max = W.amax(dim=1, keepdim=True)
+                row_scales = _fix_asymmetric_scale(row_scales, w_min, w_max, -8, 7)
+                row_zp = (-8 - _round_half_away_from_zero(w_min / row_scales)).clamp(-8, 7)
+            zero_rows = (W.amin(dim=1, keepdim=True) == 0) & (W.amax(dim=1, keepdim=True) == 0)
+            row_zp = row_zp.masked_fill(zero_rows, 0)
+            row_zp_int8 = row_zp.to(torch.int8)
+            logger.debug("GPTQ: using PiSO scales for INT4 %dx%d", out_features, in_features)
+        else:
+            logger.warning("PiSO scales shape %s != (%d, 1); falling back to default",
+                           tuple(piso.shape), out_features)
+            piso_scales = None  # fall through to default INT4 path
     if piso_scales is not None and int_bits == 8:
         piso = piso_scales.float().to(W.device)
         if piso.shape == (out_features, 1):
             row_scales = piso.clamp(min=SCALE_MIN, max=SCALE_MAX)
             row_zp_int8 = None  # PiSO + symmetric for now
             if asymmetric:
-                # Compute zero-points from PiSO scales
+                # Compute zero-points from PiSO scales.
+                # Fix the scale first so the zero-point doesn't clamp — the
+                # same guard applied in every other asymmetric branch.
                 w_min = W.amin(dim=1, keepdim=True)
+                w_max = W.amax(dim=1, keepdim=True)
+                row_scales = _fix_asymmetric_scale(row_scales, w_min, w_max, -128, 127)
                 row_zp_raw = -128 - _round_half_away_from_zero(w_min / row_scales)
                 row_zp = row_zp_raw.clamp(-128, 127)
                 zero_rows = (w_min == 0) & (W.amax(dim=1, keepdim=True) == 0)
@@ -392,6 +423,7 @@ def gptq_quantize_layer_rtn(
     asymmetric: bool = False,
     clipping_ratios: list[float] | None = None,
     piso_scales: torch.Tensor | None = None,
+    piso_zero_points: torch.Tensor | None = None,
 ) -> QuantizationResult:
     """Fallback: RTN quantization (no Hessian correction).
 
@@ -402,6 +434,8 @@ def gptq_quantize_layer_rtn(
         int_bits: quantization bit-width (4 or 8)
         asymmetric: use asymmetric quantization (scale + zero-point)
         clipping_ratios: optional list of clipping ratios to search
+        piso_scales: Optional PiSO-optimal per-row scales.
+        piso_zero_points: Optional PiSO-optimal per-row zero-points (INT4).
 
     Returns:
         QuantizationResult with quantized_W, scales, zero_points (if asymmetric), method_used.
@@ -424,6 +458,29 @@ def gptq_quantize_layer_rtn(
                 quantized_W=quantized,
                 scales=scales,
                 zero_points=None,
+                mse=mse,
+                max_err=max_err,
+                method_used="rtn_piso",
+                fallbacks=fallbacks,
+            )
+
+    if piso_scales is not None and int_bits == 4:
+        piso = piso_scales.float().to(W.device)
+        if piso.shape[0] == W.shape[0] and piso.shape[1] == 1:
+            in_features = W.shape[1]
+            scales = piso.clamp(min=SCALE_MIN, max=SCALE_MAX).to(SCALE_DTYPE)
+            if piso_zero_points is not None:
+                zps = piso_zero_points.to(torch.int8)
+            else:
+                _, zps = calculate_scales_asymmetric(W, in_features, clipping_ratios=clipping_ratios)
+            quantized = quantize_weights_asymmetric(W, scales, zps, in_features)
+            dequant = (quantized.float() - zps.float()) * scales.float()
+            mse = (W - dequant).double().pow(2).mean().item()
+            max_err = (W - dequant).abs().max().item()
+            return QuantizationResult(
+                quantized_W=quantized,
+                scales=scales,
+                zero_points=zps,
                 mse=mse,
                 max_err=max_err,
                 method_used="rtn_piso",

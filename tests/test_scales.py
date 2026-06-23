@@ -229,7 +229,7 @@ class TestAsymmetricINT8:
         W = torch.randn(16, 64)
         scales, zps = calculate_scales_int8_asymmetric(W)
         assert scales.dtype == torch.float16
-        assert zps.dtype == torch.int16
+        assert zps.dtype == torch.int8
 
     def test_quantize_range(self):
         W = torch.randn(16, 64, dtype=torch.float32)

@@ -80,7 +80,7 @@ Based on [PermuQuant (arXiv:2605.09503)](https://arxiv.org/abs/2605.09503).
 
 Single `model.safetensors` containing per-layer tensors:
 - `<name>` — `uint8` (INT4, packed 2 per byte) or `int8` (INT8)
-- `<name>_scale` — `float16` scales: `[out, num_groups]` (INT4) or `[out, 1]` (INT8)
+- `<name>_scale` — `float16` scales: `[out, 1]` per-row for both INT4 and INT8
 - `<name>.perm` — optional PermuQuant indices (`int32`)
 - `<name>_smooth` — optional SmoothQuant factors (`float16`, `[in_features]`)
 - `<name>_smoothrot_factors` — optional SmoothRot factors (`float16`, `[in_features]`, applied before Hadamard at inference)
@@ -103,7 +103,7 @@ Contains:
 
 - Only 2D weight tensors are quantized.
 - `rot_size` must be power of 4 or `0`.
-- `perm-group-size` and `quant-group-size` must be power of 2 ≥ 32. INT4 only; INT8 always uses one scale per row.
+- `perm-group-size` and `quant-group-size` must be power of 2 ≥ 32. INT8 only; INT4 always uses per-row scales.
 - GPTQ falls back to RTN for layers without calibration data.
 
 

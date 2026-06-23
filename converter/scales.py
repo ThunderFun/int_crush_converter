@@ -327,7 +327,7 @@ def calculate_scales_int8_asymmetric(
     Returns:
         (scales, zero_points):
             scales:      [out_features, 1] per-row scales
-            zero_points: [out_features, 1] int16 (int8 range [-128,127])
+            zero_points: [out_features, 1] int8 (range [-128,127])
     """
     if W.dim() != 2:
         raise ValueError(f"Expected 2D tensor, got {W.dim()}D")
@@ -342,7 +342,7 @@ def calculate_scales_int8_asymmetric(
         scales = ((w_max - w_min).float() / 255.0).clamp(min=SCALE_MIN, max=SCALE_MAX)
         scales = _fix_asymmetric_scale(scales, w_min, w_max, -128, 127)
         zero_points = (-128 - _round_half_away_from_zero(w_min / scales)).clamp(-128, 127)
-        return scales.to(SCALE_DTYPE), zero_points.to(torch.int16)
+        return scales.to(SCALE_DTYPE), zero_points.to(torch.int8)
 
     W_3d = W.unsqueeze(1)  # [out, 1, in]
 
@@ -358,7 +358,7 @@ def calculate_scales_int8_asymmetric(
         return candidate_scales, candidate_zp, mse
 
     best_scales, best_zp = _search_clipping_ratio(clipping_ratios, _compute)
-    return best_scales.to(SCALE_DTYPE), best_zp.to(torch.int16)
+    return best_scales.to(SCALE_DTYPE), best_zp.to(torch.int8)
 
 
 def quantize_weights_int8_asymmetric(

@@ -4,8 +4,11 @@ Fuses candidate-scale evaluation into one kernel launch, eliminating
 O(B×C×D) intermediates of the PyTorch path.
 
 Two kernels:
-- Symmetric INT8: evaluates coarse+fine candidate scales, picks Hessian-weighted optimum per row.
-- Asymmetric INT8: same, also optimizes zero-point per candidate.
+- Symmetric: evaluates coarse+fine candidate scales, picks Hessian-weighted optimum per row.
+- Asymmetric: same, also optimizes zero-point per candidate.
+
+Both kernels are parameterized via ``CLAMP_MIN``/``CLAMP_MAX`` constexpr
+arguments, so the same code serves INT8 (−128..127) and INT4 (−8..7).
 
 Candidate-major, D-minor loop order keeps W in L2 cache across evaluations.
 Only 3 registers per row (running_cost, best_cost, best_scale) vs O(C×D) broadcast.
@@ -167,13 +170,18 @@ if _HAS_TRITON:
         ``zp = clamp(round(CLAMP_MIN - w_min / s), CLAMP_MIN, CLAMP_MAX)``
         and quantization is ``q = round(w / s + zp)``.
 
+        The reference scale is ``range / (CLAMP_MAX - CLAMP_MIN)``, which
+        equals ``range / 255`` for INT8 and ``range / 15`` for INT4.  This
+        makes the kernel bit-width agnostic — just pass different
+        ``CLAMP_MIN``/``CLAMP_MAX`` constexpr values.
+
         Args:
             W_ptr:          [M, D] float32 weight matrix.
             h_diag_ptr:     [D] float32 Hessian diagonal.
             w_min_ptr:      [M] float32 per-row weight minimum.
             w_max_ptr:      [M] float32 per-row weight maximum.
             scales_ptr:     [M] float32 output optimal scales.
-            zp_ptr:         [M] int16 output optimal zero-points.
+            zp_ptr:         [M] int8 output optimal zero-points.
             M:              number of rows.
             D:              number of columns.
             num_d_blocks:   ``ceil(D / D_BLOCK)``, runtime.
@@ -181,8 +189,8 @@ if _HAS_TRITON:
             NUM_FINE:       number of fine candidates (constexpr).
             D_BLOCK:        column block size (constexpr).
             BLOCK_ROWS:     rows per program (constexpr).
-            CLAMP_MIN:      minimum quantized value (-128.0).
-            CLAMP_MAX:      maximum quantized value (127.0).
+            CLAMP_MIN:      minimum quantized value (−128 for INT8, −8 for INT4).
+            CLAMP_MAX:      maximum quantized value (127 for INT8, 7 for INT4).
         """
         pid = tl.program_id(0)
         row_start = pid * BLOCK_ROWS
@@ -192,7 +200,7 @@ if _HAS_TRITON:
         w_min = tl.load(w_min_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
         w_max = tl.load(w_max_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
         range_val = w_max - w_min
-        s_ref = range_val / 255.0
+        s_ref = range_val / (CLAMP_MAX - CLAMP_MIN)
         s_ref = tl.maximum(s_ref, 1e-10)
 
         best_cost = tl.full([BLOCK_ROWS], value=1e30, dtype=tl.float32)
@@ -284,7 +292,7 @@ if _HAS_TRITON:
             best_zp = tl.where(is_better, zp, best_zp)
 
         tl.store(scales_ptr + row_offs, best_s, mask=row_mask)
-        tl.store(zp_ptr + row_offs, best_zp.to(tl.int16), mask=row_mask)
+        tl.store(zp_ptr + row_offs, best_zp.to(tl.int8), mask=row_mask)
 
 
 def compute_piso_scales_int8_triton(
@@ -365,7 +373,7 @@ def compute_piso_scales_int8_asymmetric_triton(
 
     Returns:
         ``(scales, zero_points)`` where scales is [M, 1] float32 and
-        zero_points is [M, 1] int16, or None if Triton is unavailable.
+        zero_points is [M, 1] int8, or None if Triton is unavailable.
     """
     if not _HAS_TRITON:
         return None
@@ -387,7 +395,7 @@ def compute_piso_scales_int8_asymmetric_triton(
     w_max = W.amax(dim=1).contiguous()
 
     scales = torch.empty(M, dtype=torch.float32, device=W.device)
-    zp = torch.empty(M, dtype=torch.int16, device=W.device)
+    zp = torch.empty(M, dtype=torch.int8, device=W.device)
     num_d_blocks = triton.cdiv(D, PISO_D_BLOCK)
 
     BLOCK_ROWS = TRITON_BLOCK_ROWS_PISO
@@ -406,6 +414,141 @@ def compute_piso_scales_int8_asymmetric_triton(
         )
     except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
         logger.debug("PiSO Triton asymmetric fallback: %s", e)
+        return None
+
+    return scales.unsqueeze(1), zp.unsqueeze(1)  # [M, 1] each
+
+
+# ---------------------------------------------------------------------------
+# INT4 Triton wrappers (reuse existing kernels with INT4 clamp values)
+# ---------------------------------------------------------------------------
+
+
+def compute_piso_scales_int4_triton(
+    W: torch.Tensor,
+    hessian_diag: torch.Tensor,
+    num_coarse: int = 128,
+    num_fine: int = 16,
+) -> torch.Tensor | None:
+    """Triton-accelerated PiSO grid search for symmetric INT4.
+
+    Reuses the symmetric kernel with ``CLAMP_MIN=-8.0`` and ``CLAMP_MAX=7.0``.
+
+    Args:
+        W:              [M, D] float32 weight matrix on CUDA.
+        hessian_diag:   [D] float32 Hessian diagonal.
+        num_coarse:     number of coarse candidates (default 128).
+        num_fine:       number of fine candidates (default 16).
+
+    Returns:
+        [M, 1] float32 optimal per-row scales, or None if Triton is
+        unavailable or the kernel fails.
+    """
+    if not _HAS_TRITON:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if num_coarse < 2 or num_fine < 2:
+        logger.warning("PiSO: num_coarse and num_fine must be >= 2, got %d and %d", num_coarse, num_fine)
+        return None
+
+    M, D = W.shape
+    if not W.is_contiguous():
+        W = W.contiguous()
+
+    h_diag = hessian_diag.float()[:D]
+    if not h_diag.is_contiguous():
+        h_diag = h_diag.contiguous()
+
+    # Precompute absmax scale per row on GPU (INT4 divisor = 7.0).
+    s_absmax = W.abs().amax(dim=1) / 7.0
+    s_absmax = s_absmax.clamp(min=1e-10).contiguous()
+
+    scales = torch.empty(M, dtype=torch.float32, device=W.device)
+    num_d_blocks = triton.cdiv(D, PISO_D_BLOCK)
+
+    BLOCK_ROWS = TRITON_BLOCK_ROWS_PISO
+    grid = (triton.cdiv(M, BLOCK_ROWS),)
+
+    try:
+        _piso_symmetric_kernel[grid](
+            W, h_diag, s_absmax, scales,
+            M, D, num_d_blocks,
+            NUM_COARSE=num_coarse,
+            NUM_FINE=num_fine,
+            D_BLOCK=PISO_D_BLOCK,
+            BLOCK_ROWS=BLOCK_ROWS,
+            CLAMP_MIN=-8.0,
+            CLAMP_MAX=7.0,
+        )
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        logger.debug("PiSO Triton INT4 symmetric fallback: %s", e)
+        return None
+
+    return scales.unsqueeze(1)  # [M, 1]
+
+
+def compute_piso_scales_int4_asymmetric_triton(
+    W: torch.Tensor,
+    hessian_diag: torch.Tensor,
+    num_coarse: int = 128,
+    num_fine: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Triton-accelerated PiSO grid search for asymmetric INT4.
+
+    Reuses the asymmetric kernel with ``CLAMP_MIN=-8.0`` and ``CLAMP_MAX=7.0``.
+    The kernel automatically computes ``s_ref = range / 15`` (from
+    ``CLAMP_MAX - CLAMP_MIN = 15``).
+
+    Args:
+        W:              [M, D] float32 weight matrix on CUDA.
+        hessian_diag:   [D] float32 Hessian diagonal.
+        num_coarse:     number of coarse candidates (default 128).
+        num_fine:       number of fine candidates (default 16).
+
+    Returns:
+        ``(scales, zero_points)`` where scales is [M, 1] float32 and
+        zero_points is [M, 1] int8, or None if Triton is unavailable.
+    """
+    if not _HAS_TRITON:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if num_coarse < 2 or num_fine < 2:
+        logger.warning("PiSO: num_coarse and num_fine must be >= 2, got %d and %d", num_coarse, num_fine)
+        return None
+
+    M, D = W.shape
+    if not W.is_contiguous():
+        W = W.contiguous()
+
+    h_diag = hessian_diag.float()[:D]
+    if not h_diag.is_contiguous():
+        h_diag = h_diag.contiguous()
+
+    w_min = W.amin(dim=1).contiguous()
+    w_max = W.amax(dim=1).contiguous()
+
+    scales = torch.empty(M, dtype=torch.float32, device=W.device)
+    zp = torch.empty(M, dtype=torch.int8, device=W.device)
+    num_d_blocks = triton.cdiv(D, PISO_D_BLOCK)
+
+    BLOCK_ROWS = TRITON_BLOCK_ROWS_PISO
+    grid = (triton.cdiv(M, BLOCK_ROWS),)
+
+    try:
+        _piso_asymmetric_kernel[grid](
+            W, h_diag, w_min, w_max, scales, zp,
+            M, D, num_d_blocks,
+            NUM_COARSE=num_coarse,
+            NUM_FINE=num_fine,
+            D_BLOCK=PISO_D_BLOCK,
+            BLOCK_ROWS=BLOCK_ROWS,
+            CLAMP_MIN=-8.0,
+            CLAMP_MAX=7.0,
+        )
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        logger.debug("PiSO Triton INT4 asymmetric fallback: %s", e)
         return None
 
     return scales.unsqueeze(1), zp.unsqueeze(1)  # [M, 1] each

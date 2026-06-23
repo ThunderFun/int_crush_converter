@@ -12,6 +12,12 @@ from .scales import (
     calculate_scales_int8_asymmetric,
     quantize_weights_int8_asymmetric,
 )
+from .piso import (
+    compute_piso_scales_int8,
+    compute_piso_scales_int8_asymmetric,
+    compute_piso_scales_int4,
+    compute_piso_scales_int4_asymmetric,
+)
 from .config import INT4_SCALE_DIVISOR, INT8_SCALE_DIVISOR
 from .dlr import (
     is_dlr,
@@ -81,4 +87,8 @@ __all__ = [
     "FFNPair",
     "decompose_weight",
     "SVDResult",
+    "compute_piso_scales_int8",
+    "compute_piso_scales_int8_asymmetric",
+    "compute_piso_scales_int4",
+    "compute_piso_scales_int4_asymmetric",
 ]
