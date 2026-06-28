@@ -68,7 +68,15 @@ class QuantizeConfig:
     """Eigenvalue threshold for low-rank greedy."""
 
     comfy_compat: bool = False
-    """Write comfy_quant metadata for ComfyUI-INT8-Fast compatibility."""
+    """Write .comfy_quant metadata in ComfyUI's native INT8 format.
+
+    Uses ``{"format": "int8_tensorwise", "convrot": true, ...}``.
+    Requires ``int_bits=8``."""
+
+    comfy_int8_fast: bool = False
+    """Write comfy_quant metadata for ComfyUI-INT8-Fast compatibility.
+
+    Uses the legacy ``{"per_row": true, ...}`` format.  Requires ``int_bits=8``."""
 
     asymmetric: bool = False
     """Use asymmetric quantization (scale + zero-point)."""

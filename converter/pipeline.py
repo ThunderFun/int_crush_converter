@@ -235,6 +235,23 @@ def quantize_model(
     if config.svd_rank > 0:
         logger.info("SVD-absorbed enabled: rank=%d", config.svd_rank)
 
+    # ComfyUI metadata warnings: smoothrot/smoothquant/svd are not
+    # representable in comfy_quant metadata and will be omitted.
+    if config.comfy_compat or config.comfy_int8_fast:
+        unsupported = []
+        if config.smoothrot:
+            unsupported.append("smoothrot")
+        elif config.smoothquant:
+            unsupported.append("smoothquant")
+        if config.svd_rank > 0:
+            unsupported.append("svd-absorbed")
+        if unsupported:
+            logger.warning(
+                "ComfyUI metadata does not support %s; these fields will be "
+                "omitted from .comfy_quant. The quantized weights themselves "
+                "are unaffected.", ", ".join(unsupported)
+            )
+
     is_int8 = config.int_bits == 8
 
     # Seed CPU (Mersenne Twister) and CUDA (Philox) RNGs for reproducibility.
@@ -1037,23 +1054,29 @@ def quantize_model(
             output_dict[f"{name}_smooth"] = smoothing_factors[:orig_in_features].to(SMOOTH_FACTOR_DTYPE)
 
         # ComfyUI-INT8-Fast compatibility: write comfy_quant metadata tensor
-        if config.comfy_compat and config.rot_size > 0 and is_int8:
+        if config.comfy_int8_fast and is_int8:
             layer_prefix = name.rsplit(".weight", 1)[0]
             comfy_quant_data = {
-                "convrot": True,
-                "convrot_groupsize": config.rot_size,
                 "per_row": True,
-                "smoothquant": config.smoothquant and not is_smoothrot_down,
-                "smooth_alpha": config.smooth_alpha if (config.smoothquant and not is_smoothrot_down) else None,
             }
-            if is_smoothrot_down:
-                comfy_quant_data["smoothrot"] = True
-                comfy_quant_data["smoothrot_transform_order"] = "smooth_then_rotate"
-                comfy_quant_data["smooth_alpha"] = smoothrot_alpha
-            if svd_result is not None:
-                comfy_quant_data["svd_absorbed"] = True
-                comfy_quant_data["svd_rank"] = svd_result.L1.shape[1]
+            if config.rot_size > 0:
+                comfy_quant_data["convrot"] = True
+                comfy_quant_data["convrot_groupsize"] = config.rot_size
             comfy_quant = json.dumps(comfy_quant_data).encode("utf-8")
+            output_dict[f"{layer_prefix}.comfy_quant"] = torch.tensor(
+                list(comfy_quant), dtype=torch.uint8
+            )
+
+        # ComfyUI native INT8 format: write comfy_quant with format field
+        if config.comfy_compat and is_int8:
+            layer_prefix = name.rsplit(".weight", 1)[0]
+            comfy_quant_data = {
+                "format": "int8_tensorwise",
+            }
+            if config.rot_size > 0:
+                comfy_quant_data["convrot"] = True
+                comfy_quant_data["convrot_groupsize"] = config.rot_size
+            comfy_quant = json.dumps(comfy_quant_data, separators=(",", ":")).encode("utf-8")
             output_dict[f"{layer_prefix}.comfy_quant"] = torch.tensor(
                 list(comfy_quant), dtype=torch.uint8
             )

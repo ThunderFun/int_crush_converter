@@ -176,7 +176,11 @@ def main() -> None:
                              "Lower values keep more eigenvalues (better quality, slower). "
                              "Only used with --greedy-passes > 0 and Triton available.")
     parser.add_argument("--comfy-compat", action="store_true",
-                        help="Write comfy_quant metadata for ComfyUI-INT8-Fast compatibility (INT8 + ConvRot only)")
+                        help="Write .comfy_quant in ComfyUI's native INT8 format "
+                             "({'format': 'int8_tensorwise', ...}). INT8 only.")
+    parser.add_argument("--comfy-int8-fast", action="store_true",
+                        help="Write comfy_quant metadata for ComfyUI-INT8-Fast "
+                             "compatibility (INT8 only)")
     parser.add_argument("--piso", action="store_true",
                         help="Use PiSO data-aware scale optimization (requires -c calibration). "
                              "Computes per-row scales that minimize output error using the "
@@ -234,6 +238,14 @@ def main() -> None:
     if args.rot_size != 0 and (args.rot_size & (args.rot_size - 1)) != 0:
         parser.error(f"--rot-size must be 0 or a power of 2, got {args.rot_size}")
 
+    # ComfyUI INT8 metadata validation
+    if args.comfy_compat:
+        if args.int_bits != 8:
+            parser.error("--comfy-compat requires --int-bits 8")
+    if args.comfy_int8_fast:
+        if args.int_bits != 8:
+            parser.error("--comfy-int8-fast requires --int-bits 8")
+
     # SmoothRot validation: auto-enable smooth-then-rotate when both
     # --smoothquant and --rot-size > 0 are active (correct pipeline order).
     if args.smoothquant and args.rot_size > 0:
@@ -286,6 +298,7 @@ def main() -> None:
         greedy_passes=args.greedy_passes,
         rank_threshold=args.rank_threshold,
         comfy_compat=args.comfy_compat,
+        comfy_int8_fast=args.comfy_int8_fast,
         piso_scales=args.piso,
         asymmetric=args.asymmetric,
         clipping_ratios=clipping_ratios,

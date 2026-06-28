@@ -47,7 +47,8 @@ python -m converter.cli -i model.safetensors -o ./out --rot-size 256 --int-bits 
 | `--tau` | `0.0` | PermuQuant threshold |
 | `--exclude-patterns` | — | Extra layers to skip (appended to defaults) |
 | `--skip-patterns` | defaults | Replace default skip list entirely |
-| `--comfy-compat` | off | ComfyUI-INT8-Fast metadata, INT8 only |
+| `--comfy-compat` | off | ComfyUI native INT8 metadata (`format: int8_tensorwise`). INT8 only |
+| `--comfy-int8-fast` | off | ComfyUI-INT8-Fast metadata. INT8 only |
 | `--asymmetric` | off | Asymmetric quantization (scale + zero-point). Better for skewed distributions |
 | `--clipping-ratios` | — | Comma-separated clipping ratios to search, e.g. `0.8,0.85,0.9,0.95,1.0`. Clips outliers for finer grid resolution |
 | `--smoothquant` | off | Per-channel smoothing before quantization. Reduces per-row weight dynamic range |
